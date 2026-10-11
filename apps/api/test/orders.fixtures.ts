@@ -2,10 +2,6 @@
 // Media rows are inserted directly with Drizzle: the upload pipeline is tested elsewhere.
 import { getQueueToken } from '@nestjs/bullmq';
 import type { NestExpressApplication } from '@nestjs/platform-express';
-import {
-  getStorageToken,
-  type ThrottlerStorageService,
-} from '@nestjs/throttler';
 import type { Queue } from 'bullmq';
 import { eq, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
@@ -25,13 +21,10 @@ export type MediaRow = typeof media.$inferSelect;
 
 /**
  * Registration is rate limited (10/min per IP) and every test registers several users
- * from the same IP, so the in-memory rate limit counters are cleared before each test.
+ * from the same IP, so the rate-limit counters (in Redis) are cleared before each test.
+ * It is async: callers must await it, or a test can start before the counters are reset.
  */
-export function clearRateLimits(app: NestExpressApplication) {
-  // The in-memory storage keeps hit counts in two internal maps; its public
-  // onApplicationShutdown() clears both (it restarts its sweep timer on the next hit).
-  app.get<ThrottlerStorageService>(getStorageToken()).onApplicationShutdown();
-}
+export { clearRateLimits } from './helpers.js';
 
 export async function createUploader(app: NestExpressApplication) {
   return registerUser(app, 'UPLOADER');

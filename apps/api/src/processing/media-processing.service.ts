@@ -46,6 +46,7 @@ import {
   viewerMarkText,
 } from './preview-plan.js';
 import { DUPLICATE_MAX_DISTANCE, isInformativePhash, minDistance } from './phash.js';
+import { readHeadAndTail, scanAiSignatures } from './ai-signatures.js';
 import { assessRisk } from './risk.js';
 import { VerifierClient, type VerifierResult, VerifierUnavailableError } from './verifier.client.js';
 
@@ -422,6 +423,14 @@ export class MediaProcessingService {
     const phashes = result?.phashes.filter(isInformativePhash) ?? [];
     const duplicate = phashes.length ? await this.findDuplicate(row, phashes) : null;
 
+    // Labels AI tools write into their own files: the cheapest, most certain check.
+    const aiSignatures = scanAiSignatures(await readHeadAndTail(original), [
+      probed.fileMetadata.encoder,
+      probed.fileMetadata.device,
+      result?.c2pa.claimGenerator,
+      result?.c2pa.issuer,
+    ]);
+
     const risk = assessRisk({
       verifierAvailable: result !== null,
       ai: result ? result.ai : { available: false, score: null, model: null },
@@ -429,6 +438,7 @@ export class MediaProcessingService {
       duplicateOfId: duplicate?.mediaId ?? null,
       claimed: { capturedAt: row.capturedAt, latitude: row.latitude, longitude: row.longitude },
       fileMetadata: probed.fileMetadata,
+      aiSignatures,
     });
 
     // Full metadata: shown to admins only (toVerificationView hides it from everyone else).
@@ -459,6 +469,7 @@ export class MediaProcessingService {
           }
         : { available: false, error: verifierError, framesSent: frames.length },
       duplicate: duplicate ? { mediaId: duplicate.mediaId, distance: duplicate.distance } : null,
+      aiSignatures,
     };
 
     const values = {

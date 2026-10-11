@@ -19,7 +19,7 @@ describe('Reports (e2e)', () => {
   });
   beforeEach(async () => {
     await resetDb(app);
-    clearRateLimits(app);
+    await clearRateLimits(app);
   });
   afterAll(async () => {
     await app.close();

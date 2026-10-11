@@ -7,6 +7,7 @@
 // (see docs/RESEARCH.md), so an admin always makes the final decision.
 import type { RiskLevel, VerificationSignal } from '../db/schema.js';
 import { distanceKm } from '../common/views.js';
+import type { AiSignature } from './ai-signatures.js';
 
 export type C2paStatus = 'valid' | 'invalid' | 'absent' | 'error' | 'unsupported';
 
@@ -31,6 +32,8 @@ export interface RiskInput {
     device: string | null;
     encoder: string | null;
   };
+  /** AI-generator labels found inside the file (see ai-signatures.ts). */
+  aiSignatures?: AiSignature[];
 }
 
 export interface RiskResult {
@@ -79,6 +82,33 @@ export function assessRisk(input: RiskInput): RiskResult {
         `The AI detector rates this ${percent}% likely to be AI-generated. Detectors miss many modern fakes, so this is not proof it is real.`,
       );
     }
+  }
+
+  // ---- 1b. Labels the AI tools write into their own files ----
+  // The strongest evidence we have: a camera never writes "Midjourney" or
+  // "trainedAlgorithmicMedia". Absence proves nothing (labels are easy to strip).
+  const aiSignatures = input.aiSignatures ?? [];
+  for (const sig of aiSignatures) {
+    if (sig.kind === 'edited') {
+      add(
+        'AI_EDIT_SIGNATURE',
+        'danger',
+        `The file is labelled as a real capture changed with ${sig.tool}: "${sig.evidence}". Parts of the picture may be made up.`,
+      );
+    } else {
+      add(
+        'AI_SIGNATURE',
+        'danger',
+        `The file is labelled as made by ${sig.tool}: "${sig.evidence}" was found in its metadata. Cameras never write this, so treat it as AI-generated.`,
+      );
+    }
+  }
+  if (aiSignatures.length === 0) {
+    add(
+      'NO_AI_LABEL',
+      'info',
+      'No AI-generator labels were found in the file. Labels are easy to remove, so this alone does not prove it is real.',
+    );
   }
 
   // ---- 2. Content Credentials (C2PA) ----
@@ -161,8 +191,9 @@ export function assessRisk(input: RiskInput): RiskResult {
   // ---- 5. Combine: the most serious signal sets the level ----
   let level = signals.reduce<RiskLevel>((worst, s) => maxLevel(worst, RISK_OF[s.level]), 'LOW');
   // Valid provenance is strong evidence, so it lowers the risk one step,
-  // except for duplicates: a signed file can still be someone else's.
-  if (c2paValid && !input.duplicateOfId) level = lowerLevel(level);
+  // except for duplicates (a signed file can still be someone else's) and AI labels
+  // (OpenAI and Adobe sign their AI images: valid credentials then confirm the label).
+  if (c2paValid && !input.duplicateOfId && aiSignatures.length === 0) level = lowerLevel(level);
 
   return { riskLevel: level, signals };
 }

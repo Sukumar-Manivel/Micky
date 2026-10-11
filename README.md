@@ -14,7 +14,7 @@ When a fire, accident or flood happens, reporters usually arrive after it's over
 ## How it works
 
 1. **A witness uploads** a video or photo from their phone, with location and capture time.
-2. **A background worker processes it.** It checks file type and size, rejects exact and near duplicates, and asks the verification service for an AI-generated score and C2PA provenance. It cross-checks GPS and time metadata, then writes a risk level with the reasons.
+2. **A background worker processes it.** It checks file type and size, rejects exact and near duplicates, looks for the labels AI tools write into their own files (Midjourney, DALL·E, Stable Diffusion, Google, Adobe, the IPTC "AI-generated" tag), and asks the verification service for an AI-detector score and C2PA provenance. It cross-checks GPS and time metadata, then writes a risk level with the reasons.
 3. **An admin reviews it** with those signals beside a watermarked preview, then approves or rejects it.
 4. **Approved newsrooms browse incidents** on a live feed and map. Uploads near each other in place and time are grouped into one incident and ranked by a trending score. Each newsroom gets its own preview with its name burned into the picture, so a leaked copy is traceable.
 5. **A newsroom buys a licence**, non-exclusive or exclusive, through Razorpay. It downloads a copy with the uploader's identifying metadata removed, through a single-use link bound to the buyer.

@@ -27,7 +27,7 @@ describe('assessRisk', () => {
   it('rates a clean upload LOW', () => {
     const result = assessRisk(input());
     expect(result.riskLevel).toBe('LOW');
-    expect(codes(result)).toEqual(['AI_SCORE_LOW', 'C2PA_ABSENT']);
+    expect(codes(result)).toEqual(['AI_SCORE_LOW', 'NO_AI_LABEL', 'C2PA_ABSENT']);
   });
 
   it('rates a high AI score HIGH and a medium one MEDIUM', () => {
@@ -105,7 +105,7 @@ describe('assessRisk', () => {
       }),
     );
     expect(result.riskLevel).toBe('MEDIUM');
-    expect(codes(result)).toEqual(['VERIFIER_UNAVAILABLE']);
+    expect(codes(result)).toEqual(['VERIFIER_UNAVAILABLE', 'NO_AI_LABEL']);
   });
 
   it('writes every message in plain English', () => {
@@ -117,5 +117,28 @@ describe('assessRisk', () => {
       }),
     );
     for (const s of result.signals) expect(s.message).toMatch(/^[A-Z].*\.$/);
+  });
+  describe('AI-generator labels in the file', () => {
+    const label = { tool: 'Midjourney', kind: 'generated' as const, evidence: 'software midjourney v7' };
+
+    it('rates an upload HIGH when the file says an AI tool made it, even with a low model score', () => {
+      const result = assessRisk(input({ aiSignatures: [label] }));
+      expect(result.riskLevel).toBe('HIGH');
+      expect(result.signals.find((s) => s.code === 'AI_SIGNATURE')?.message).toContain('Midjourney');
+      expect(codes(result)).not.toContain('NO_AI_LABEL');
+    });
+
+    it('rates a real capture edited with generative AI HIGH, with its own message', () => {
+      const result = assessRisk(
+        input({ aiSignatures: [{ tool: 'a generative AI editing tool', kind: 'edited', evidence: 'compositewithtrainedalgorithmicmedia' }] }),
+      );
+      expect(result.riskLevel).toBe('HIGH');
+      expect(codes(result)).toContain('AI_EDIT_SIGNATURE');
+    });
+
+    it('does not let valid Content Credentials lower the risk when they come with an AI label', () => {
+      const result = assessRisk(input({ c2pa: { status: 'valid', issuer: 'OpenAI' }, aiSignatures: [label] }));
+      expect(result.riskLevel).toBe('HIGH');
+    });
   });
 });

@@ -46,7 +46,7 @@ describe('Orders (e2e, mock provider)', () => {
   });
   beforeEach(async () => {
     await resetDb(app);
-    clearRateLimits(app);
+    await clearRateLimits(app);
   });
   afterAll(async () => {
     await app.close();

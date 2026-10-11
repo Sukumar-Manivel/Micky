@@ -16,6 +16,7 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { crc32 } from 'node:zlib';
 import request from 'supertest';
 import { AppConfig } from '../src/config/app-config.js';
 import { incidents, media, orders, verifications } from '../src/db/schema.js';
@@ -288,9 +289,21 @@ beforeEach(async () => {
 
 describe('POST /media: access and validation', () => {
   it('requires an UPLOADER (401 without a token, 403 for a channel), before storing anything', async () => {
-    await upload(null, fx.photo).expect(401);
+    // The status, checked strictly on a request without a file...
+    await upload(null, null).expect(401);
     const channel = await createUser(app, 'CHANNEL', { channelStatus: 'APPROVED' });
-    await upload(channel.accessToken, fx.photo).expect(403);
+    await upload(channel.accessToken, null).expect(403);
+    // ...and with a file. The guard answers before the body is read and the server closes
+    // the connection, so the client may see EPIPE/ECONNRESET while still sending: that is
+    // the intended behaviour (nothing is read or stored), not a failure.
+    for (const token of [null, channel.accessToken]) {
+      try {
+        const res = await upload(token, fx.photo);
+        expect([401, 403]).toContain(res.status);
+      } catch (err) {
+        expect(['EPIPE', 'ECONNRESET']).toContain((err as NodeJS.ErrnoException).code);
+      }
+    }
     await expectTmpUploadsEmpty();
   });
 
@@ -683,6 +696,44 @@ describe('Processing (worker service, mock verifier)', () => {
     const p = await request(s).post(`/api/v1/market/media/${item.id}/preview`).set(auth(u.accessToken)).expect(200);
     expect(p.body.kind).toBe('image');
     await request(s).get(new URL(p.body.imageUrl).pathname).expect(200).expect('content-type', /image\/jpeg/);
+  });
+
+  it('flags files labelled by AI generators as HIGH risk (Stable Diffusion PNG, AI-labelled JPEG)', { timeout: 60_000 }, async () => {
+    // A real PNG with the "parameters" text chunk AUTOMATIC1111/Forge write after IHDR.
+    const png = await readFile(fx.png);
+    const text = Buffer.concat([
+      Buffer.from('tEXt', 'latin1'),
+      Buffer.from('parameters\0a burning warehouse, news photo\nSteps: 30, Sampler: Euler a, CFG scale: 7, Seed: 42', 'latin1'),
+    ]);
+    const chunk = Buffer.alloc(text.length + 8);
+    chunk.writeUInt32BE(text.length - 4, 0);
+    text.copy(chunk, 4);
+    chunk.writeUInt32BE(crc32(text), text.length + 4);
+    const sdPng = path.join(fixtureDir, 'sd.png');
+    await writeFile(sdPng, Buffer.concat([png.subarray(0, 33), chunk, png.subarray(33)]));
+
+    // A real JPEG with an XMP packet carrying the IPTC "trainedAlgorithmicMedia" label
+    // (what Google, OpenAI, Meta and Adobe write into their AI images).
+    const jpg = await readFile(fx.photo);
+    const xmp = Buffer.from(
+      'http://ns.adobe.com/xap/1.0/\0<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:Description ' +
+        'Iptc4xmpExt:DigitalSourceType="http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"/></x:xmpmeta>',
+      'latin1',
+    );
+    const app1 = Buffer.concat([Buffer.from([0xff, 0xe1, (xmp.length + 2) >> 8, (xmp.length + 2) & 0xff]), xmp]);
+    const aiJpg = path.join(fixtureDir, 'ai-labelled.jpg');
+    await writeFile(aiJpg, Buffer.concat([jpg.subarray(0, 2), app1, jpg.subarray(2)]));
+
+    const u = await createUser(app, 'UPLOADER');
+    for (const [file, tool] of [[sdPng, 'Stable Diffusion'], [aiJpg, 'trained algorithmic media']] as const) {
+      const item = await uploadOk(u, file);
+      await processing.process(item.id, { finalAttempt: false });
+      const v = (await loadVerification(item.id))!;
+      expect(v.riskLevel).toBe('HIGH');
+      const signal = v.signals.find((sig) => sig.code === 'AI_SIGNATURE');
+      expect(signal?.message).toContain(tool);
+      expect((v.metadata as { aiSignatures: unknown[] }).aiSignatures).toHaveLength(1);
+    }
   });
 
   it('keeps portrait videos portrait', { timeout: 60_000 }, async () => {

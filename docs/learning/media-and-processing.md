@@ -175,6 +175,31 @@ The generic preview carries "MICKY PREVIEW", which says nothing about who saved 
 
 **Race between two identical uploads:** both could pass the "is the checksum taken?" check at the same moment. The schema has no unique index on `checksum` (FAILED rows may repeat), so the insert runs under `pg_advisory_xact_lock(hashtext(checksum))`: the second request waits for the first to commit, re-checks and gets 409. The e2e test fires two identical uploads in parallel and expects exactly one 201 and one 409.
 
+## 5b. Is it AI-generated? Three layers, not one detector
+
+Spotting AI-generated footage is the core promise of Micky, and **no single check is reliable**. Every AI detector misses images from generators newer than its training data, and every label can be stripped. So the worker combines three independent layers, and a human admin makes the final call:
+
+| Layer | Where | What it catches | Weakness |
+|---|---|---|---|
+| **1. AI labels inside the file** | `processing/ai-signatures.ts` (worker) | Files that say what made them: the IPTC/C2PA label `trainedAlgorithmicMedia` (used by Google Gemini/Imagen, OpenAI ChatGPT/DALL·E/Sora, Adobe Firefly, Meta AI, Microsoft), generator names (Midjourney, Firefly, Flux…) in EXIF/XMP/QuickTime tags, and the generation settings AUTOMATIC1111 and ComfyUI save in PNGs | A screenshot, WhatsApp or a re-encode removes the labels |
+| **2. AI-image classifier** | `services/verifier` (a ViT model) | Typical pixel patterns of generated images, even without labels | Unreliable on new generators; gives a probability, not proof |
+| **3. Human review** | Admin review queue | Context: does the scene match the place and time, is it a known fake | Slow; needs judgement |
+
+**How layer 1 works.** Metadata lives near the start of photos and PNGs and at the start or end of MP4/MOV files. So the worker reads the first and last 8 MB of the original as raw bytes, lower-cases them, and searches for long, specific strings ("midjourney", "trainedalgorithmicmedia", "steps: 30, sampler: …"). It doesn't decode anything, needs no model, and takes milliseconds. Strings are long enough that random video data never matches them by chance (a test scans 32 MB of random bytes).
+
+**How results become a risk level** (`risk.ts`):
+- an AI label → `AI_SIGNATURE`, **danger**, so the upload is **HIGH** risk whatever the classifier says;
+- `compositeWithTrainedAlgorithmicMedia` (a real photo changed with generative fill or an "AI eraser") → `AI_EDIT_SIGNATURE`, also HIGH;
+- no label → `NO_AI_LABEL`, **info** only, because a missing label proves nothing;
+- valid Content Credentials normally lower the risk one step, but **not** when they carry an AI label: OpenAI and Adobe sign their AI images, so valid credentials then *confirm* the image is AI-made.
+
+**Interview questions**
+
+- *How do you detect AI-generated images?* "In layers. First, cheap and certain: many generators label their output (IPTC `trainedAlgorithmicMedia` in C2PA or XMP, generator names in EXIF, Stable Diffusion's parameters in PNG text chunks), and I scan the file's metadata for those. Second, a classifier model gives a probability for unlabelled files. Third, a human reviews anything risky. A label is near-proof; its absence proves nothing, so it only adds an info note."
+- *Why not just use an AI detector model?* "They're unreliable: they miss generators released after their training, and they produce false positives on heavily edited or compressed real photos. A probability is advice, not a verdict, which is why a human approves every upload."
+- *Why scan bytes instead of parsing EXIF/XMP/C2PA properly?* "Labels live in many different containers (EXIF, XMP, PNG text chunks, QuickTime atoms, C2PA JUMBF boxes). A byte scan of the first and last few MB covers all of them in one pass, in milliseconds, with no parser bugs on malformed files. The patterns are long and specific, so false positives are vanishingly rare, and tests check camera metadata and 32 MB of random data stay silent."
+- *Can a faker get around it?* "Yes: strip the metadata, e.g. by taking a screenshot. That's why layers 2 and 3 exist, and why a missing label is never treated as evidence of authenticity."
+
 ## 6. Retries and idempotency
 
 **Idempotent** = running it twice has the same effect as running it once. BullMQ guarantees *at-least-once* processing (a job can run again after a crash or a retry), so every step must be idempotent:

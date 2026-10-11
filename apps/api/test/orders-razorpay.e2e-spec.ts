@@ -66,7 +66,7 @@ describe('Orders (e2e, Razorpay provider)', () => {
   });
   beforeEach(async () => {
     await resetDb(app);
-    clearRateLimits(app);
+    await clearRateLimits(app);
     refundApi.mockReset();
     refundApi.mockImplementation(async ({ paymentId }) => ({
       refundId: `rfnd_${paymentId.slice(4)}`,

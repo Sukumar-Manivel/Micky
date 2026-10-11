@@ -63,7 +63,7 @@ describe('Admin (e2e)', () => {
   });
   beforeEach(async () => {
     await resetDb(app);
-    clearRateLimits(app);
+    await clearRateLimits(app);
     recompute.mockClear();
     emit.mockClear();
     adminToken = (await createAdmin(app)).accessToken;
