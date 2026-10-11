@@ -78,7 +78,9 @@ services:
     build:
       context: ./services/verifier
       args:
-        # Small image without the ~345 MB model. Set to true to test the real detector.
+        # Lite image for local use: no torch, no ~345 MB model (fast on slow connections).
+        # Set VERIFIER_WITH_ML=true to build and test the real AI detector.
+        WITH_ML: ${VERIFIER_WITH_ML:-false}
         PRELOAD_MODEL: "false"
     environment:
       INTERNAL_TOKEN: dev-only-internal-token-change-me-0123456789

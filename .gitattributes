@@ -1,0 +1,7 @@
+# Keep Linux line endings for files that run inside containers or on the server,
+# even when the repo is cloned on Windows with core.autocrlf=true.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+Makefile    text eol=lf
+*.yml       text eol=lf
+Caddyfile   text eol=lf
