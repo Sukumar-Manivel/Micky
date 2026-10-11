@@ -126,6 +126,81 @@ jobs:
       - run: ruff format --check .
       - run: python -m pytest
 
+  e2e:
+    name: Browser E2E (Playwright, whole stack)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: firstframe
+          POSTGRES_PASSWORD: firstframe
+          POSTGRES_DB: firstframe
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U firstframe -d firstframe"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      # global-setup.ts drops and recreates this database, then migrates and seeds it.
+      E2E_DATABASE_URL: postgresql://firstframe:firstframe@localhost:5432/firstframe_e2e
+      E2E_REDIS_URL: redis://localhost:6379/13
+      # The verifier runs from the runner's Python (installed below), without the AI model.
+      E2E_PYTHON: python
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            apps/api/package-lock.json
+            apps/web/package-lock.json
+            e2e/package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: services/verifier/requirements*.txt
+      - name: Install ffmpeg (worker previews, test clips)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg fonts-dejavu-core fontconfig
+      - name: Install verifier (no torch)
+        run: pip install -r services/verifier/requirements.txt
+      - name: Build API
+        working-directory: apps/api
+        run: npm ci --no-audit --no-fund && npm run build
+      - name: Build web
+        working-directory: apps/web
+        run: npm ci --no-audit --no-fund && npm run build
+      - name: Install Playwright and Chromium
+        working-directory: e2e
+        run: npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
+      - name: Typecheck the tests
+        working-directory: e2e
+        run: npm run typecheck
+      - name: Run the browser tests
+        working-directory: e2e
+        run: npx playwright test
+      - name: Upload report, traces and stack logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report
+            e2e/test-results
+            e2e/.stack/*.log
+          retention-days: 7
+
   infra:
     name: Infra (compose, shellcheck)
     runs-on: ubuntu-24.04

@@ -1,0 +1,23 @@
+{
+  "name": "@firstframe/e2e",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Browser end-to-end tests for FirstFrame (Playwright): the whole stack, like a real user",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "report": "playwright show-report",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "stack:up": "tsx scripts/stack.ts up",
+    "stack:down": "tsx scripts/stack.ts down"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/node": "^22.20.5",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

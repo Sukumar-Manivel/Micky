@@ -1,6 +1,7 @@
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import { auth, registerUser, resetDb, startApp } from './helpers.js';
+import { clearRateLimits } from './orders.fixtures.js';
 
 describe('Auth (e2e)', () => {
   let app: NestExpressApplication;
@@ -46,6 +47,20 @@ describe('Auth (e2e)', () => {
       .post('/api/v1/auth/register')
       .send({ email: user.email, password: 'correct-horse-battery', name: 'Again', role: 'UPLOADER' })
       .expect(409);
+  });
+
+  it('answers 409, not 500, when the same email registers twice at the same moment (double submit)', async () => {
+    const body = { email: 'double-submit@test.local', password: 'correct-horse-battery', name: 'Twice', role: 'UPLOADER' };
+    const responses = await Promise.all(
+      [1, 2, 3, 4].map(() => request(app.getHttpServer()).post('/api/v1/auth/register').send(body)),
+    );
+    // These 4 registrations must not eat the 10/min budget of the tests after this one.
+    clearRateLimits(app);
+    const statuses = responses.map((r) => r.status).sort();
+    expect(statuses).toEqual([201, 409, 409, 409]);
+    for (const r of responses.filter((x) => x.status === 409)) {
+      expect(r.body.message).toBe('An account with this email already exists');
+    }
   });
 
   it('logs in with the right password and rejects the wrong one with the same message', async () => {

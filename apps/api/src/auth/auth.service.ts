@@ -42,20 +42,27 @@ export class AuthService {
     const passwordHash = await bcrypt.hash(dto.password, BCRYPT_ROUNDS);
 
     // User and profile are created together, or not at all.
-    const userId = await this.db.transaction(async (tx) => {
-      const [user] = await tx
-        .insert(users)
-        .values({ email: dto.email, passwordHash, name: dto.name, role: dto.role })
-        .returning({ id: users.id });
-      if (dto.role === 'CHANNEL') {
-        await tx
-          .insert(channelProfiles)
-          .values({ userId: user.id, organization: dto.organization!, website: dto.website });
-      } else {
-        await tx.insert(uploaderProfiles).values({ userId: user.id });
-      }
-      return user.id;
-    });
+    const userId = await this.db
+      .transaction(async (tx) => {
+        const [user] = await tx
+          .insert(users)
+          .values({ email: dto.email, passwordHash, name: dto.name, role: dto.role })
+          .returning({ id: users.id });
+        if (dto.role === 'CHANNEL') {
+          await tx
+            .insert(channelProfiles)
+            .values({ userId: user.id, organization: dto.organization!, website: dto.website });
+        } else {
+          await tx.insert(uploaderProfiles).values({ userId: user.id });
+        }
+        return user.id;
+      })
+      .catch((err: unknown) => {
+        // Two requests for the same email can both pass the check above (a double submit);
+        // the unique index on users.email stops the second one. Answer 409, not 500.
+        if (isUniqueViolation(err)) throw new ConflictException('An account with this email already exists');
+        throw err;
+      });
 
     this.logger.log(`Registered ${dto.role} ${userId}`);
     return this.issueTokens(userId);
@@ -136,6 +143,12 @@ export class AuthService {
 
     return { accessToken, refreshToken, refreshExpiresAt, user };
   }
+}
+
+/** Postgres error 23505 (unique_violation); Drizzle wraps the driver error in `cause`. */
+function isUniqueViolation(err: unknown): boolean {
+  const code = (e: unknown) => (typeof e === 'object' && e !== null ? (e as { code?: unknown }).code : undefined);
+  return code(err) === '23505' || code((err as { cause?: unknown } | null)?.cause) === '23505';
 }
 
 /** Refresh tokens are long random strings, so a fast SHA-256 is enough (no bcrypt needed). */

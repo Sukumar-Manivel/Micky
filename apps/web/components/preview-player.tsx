@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type Hls from 'hls.js';
 import { describeError, marketApi } from '@/lib/api';
+import { createHlsErrorPolicy, unplayableMessage } from '@/lib/hls-errors';
 import type { MediaType, PreviewSession } from '@/lib/types';
 import { Button, Skeleton } from './ui';
 
@@ -106,6 +107,10 @@ export function PreviewPlayer({
             resumeAt={resumeAt}
             wasPlaying={wasPlaying}
             onExpired={() => void load()}
+            onUnplayable={(message) => {
+              setSession(null);
+              setError(message);
+            }}
           />
         ) : (
           // A plain <img>: next/image would proxy and cache the signed, expiring URL, which we don't want.
@@ -157,14 +162,20 @@ interface HlsVideoProps {
   resumeAt: React.RefObject<number>;
   wasPlaying: React.RefObject<boolean>;
   onExpired: () => void;
+  /** Called once the player has given up (see lib/hls-errors.ts), with a message for the viewer. */
+  onUnplayable: (message: string) => void;
 }
 
-function HlsVideo({ ref, src, title, resumeAt, wasPlaying, onExpired }: HlsVideoProps) {
+function HlsVideo({ ref, src, title, resumeAt, wasPlaying, onExpired, onUnplayable }: HlsVideoProps) {
   const innerRef = useRef<HTMLVideoElement | null>(null);
   const onExpiredRef = useRef(onExpired);
+  const onUnplayableRef = useRef(onUnplayable);
+  // Lives as long as this player, across session refreshes (new `src`), so retries stay bounded.
+  const decide = useRef(createHlsErrorPolicy());
   useEffect(() => {
     onExpiredRef.current = onExpired;
-  }, [onExpired]);
+    onUnplayableRef.current = onUnplayable;
+  }, [onExpired, onUnplayable]);
 
   // Merge our ref with the parent's (React 19 passes `ref` as a normal prop).
   const setRefs = useCallback(
@@ -195,14 +206,25 @@ function HlsVideo({ ref, src, title, resumeAt, wasPlaying, onExpired }: HlsVideo
         hls = new HlsLib({ enableWorker: true, lowLatencyMode: false });
         hls.on(HlsLib.Events.ERROR, (_event, data) => {
           if (!data.fatal) return;
-          // 401/403/410 from the stream routes means the signed token expired: get a new session.
-          const status = data.response?.code ?? 0;
-          if (data.type === HlsLib.ErrorTypes.NETWORK_ERROR && [401, 403, 410].includes(status)) {
-            onExpiredRef.current();
-          } else if (data.type === HlsLib.ErrorTypes.MEDIA_ERROR) {
-            hls?.recoverMediaError();
-          } else {
-            onExpiredRef.current();
+          // Bounded recovery: an unconditional recoverMediaError() looped forever (re-downloading
+          // the same segment many times a second) in browsers that cannot decode H.264/AAC.
+          switch (decide.current({ type: data.type })) {
+            case 'recover-media':
+              hls?.recoverMediaError();
+              break;
+            case 'swap-codec-and-recover':
+              hls?.swapAudioCodec();
+              hls?.recoverMediaError();
+              break;
+            case 'refresh-session':
+              // Usually the signed token expired (401/404 from the stream routes): get a new session.
+              onExpiredRef.current();
+              break;
+            case 'give-up':
+              hls?.destroy();
+              hls = null;
+              onUnplayableRef.current(unplayableMessage(data.type));
+              break;
           }
         });
         hls.on(HlsLib.Events.MANIFEST_PARSED, resume);
