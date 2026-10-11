@@ -117,7 +117,7 @@ services:
     logging: *logging
 
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     restart: unless-stopped
     # AOF persistence so queued jobs survive restarts; noeviction because BullMQ
     # must never lose jobs silently (it errors instead when memory is full).
