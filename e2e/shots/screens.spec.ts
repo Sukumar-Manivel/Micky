@@ -6,7 +6,7 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { type Browser, type BrowserContext, type Page, expect, test } from '@playwright/test';
 import { PASSWORD, type Session, approveChannel, approveMedia, call, loginAdmin, register, waitForStatus } from '../support/api.js';
-import { ADMIN_EMAIL, ADMIN_PASSWORD, FIXTURES_DIR, ROOT, WEB_URL } from '../support/env.js';
+import { ADMIN_EMAIL, ADMIN_PASSWORD, E2E_DIR, FIXTURES_DIR, ROOT, WEB_URL } from '../support/env.js';
 import { loginInUi } from '../support/fixtures.js';
 import { queryDb } from '../support/stack.js';
 
@@ -14,23 +14,20 @@ const OUT = path.join(ROOT, 'docs', 'screenshots');
 const run = Date.now().toString(36);
 
 const CLIPS = [
-  { src: 'testsrc2', title: 'Warehouse fire near Chennai Central', category: 'FIRE', lat: 13.0827, lng: 80.2707, place: 'Chennai Central' },
-  { src: 'mandelbrot', title: 'Bus overturned near Tambaram bridge', category: 'ACCIDENT', lat: 12.9249, lng: 80.1, place: 'Tambaram' },
-  { src: 'smptehdbars', title: 'Waterlogging on Anna Salai after heavy rain', category: 'FLOOD', lat: 13.0604, lng: 80.2496, place: 'Anna Salai, near Gemini flyover' },
-  { src: 'life=s=640x360:mold=10:r=25:ratio=0.1:death_color=#C83737:life_color=#00ff00', title: 'Tree fallen across Gandhipuram main road', category: 'INFRASTRUCTURE', lat: 11.0168, lng: 76.9558, place: 'Gandhipuram, Coimbatore' },
+  { scene: 'fire', title: 'Warehouse fire near Chennai Central', category: 'FIRE', lat: 13.0827, lng: 80.2707, place: 'Chennai Central' },
+  { scene: 'bus', title: 'Bus overturned near Tambaram bridge', category: 'ACCIDENT', lat: 12.9249, lng: 80.1, place: 'Tambaram' },
+  { scene: 'flood', title: 'Waterlogging on Anna Salai after heavy rain', category: 'FLOOD', lat: 13.0604, lng: 80.2496, place: 'Anna Salai, near Gemini flyover' },
+  { scene: 'tree', title: 'Tree fallen across Gandhipuram main road', category: 'INFRASTRUCTURE', lat: 11.0168, lng: 76.9558, place: 'Gandhipuram, Coimbatore' },
 ] as const;
 
+/** Renders a synthetic phone clip of the scene (see render_scenes.py), unique per run. */
 function makeClip(i: number): string {
-  const c = CLIPS[i];
   const file = path.join(FIXTURES_DIR, `shot-${i}.mp4`);
-  const src = c.src.includes('=') ? c.src : `${c.src}=size=640x360:rate=25`;
-  execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', src, '-f', 'lavfi', '-i', 'sine=frequency=330',
-    '-t', '8', '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest',
-    '-metadata', `comment=shots-${run}-${i}`, '-movflags', '+faststart', file]);
+  execFileSync('python3', [path.join(E2E_DIR, 'shots', 'render_scenes.py'), CLIPS[i].scene, file, `shots-${run}-${i}`], { stdio: 'inherit' });
   return file;
 }
 
-async function upload(s: Session, i: number): Promise<string> {
+async function upload(s: Session, i: number, file: string): Promise<string> {
   const c = CLIPS[i];
   const form = new FormData();
   form.set('title', c.title);
@@ -41,7 +38,7 @@ async function upload(s: Session, i: number): Promise<string> {
   form.set('locationName', c.place);
   form.set('capturedAt', new Date(Date.now() - (i + 1) * 25 * 60_000).toISOString());
   form.set('rightsConfirmed', 'true');
-  form.set('file', await openAsBlob(makeClip(i), { type: 'video/mp4' }), `VID_2026101${i}.mp4`);
+  form.set('file', await openAsBlob(file, { type: 'video/mp4' }), `VID_2026101${i}.mp4`);
   const res = await call<{ id: string }>('POST', '/media', { token: s.token, form });
   expect(res.status, JSON.stringify(res.body)).toBe(201);
   return res.body.id;
@@ -74,13 +71,15 @@ test.describe.serial('screenshots', () => {
 
   test('seed demo data', async () => {
     mkdirSync(FIXTURES_DIR, { recursive: true });
+    // Render first: it takes ~45 s, longer than the e2e stack's access-token lifetime.
+    const files = CLIPS.map((_, i) => makeClip(i));
     await queryDb(`UPDATE users SET name = 'Micky Admin' WHERE email = $1`, [ADMIN_EMAIL]);
     const admin = await loginAdmin();
     const uploader = await register('UPLOADER', { name: 'Priya Raman', email: uploaderEmail });
     ids = [];
     // One at a time: the API caps uploads still processing per witness (review M6).
     for (let i = 0; i < CLIPS.length; i++) {
-      ids.push(await upload(uploader, i));
+      ids.push(await upload(uploader, i, files[i]));
       await waitForStatus(uploader, ids[i], 'IN_REVIEW', 120_000);
     }
     for (const id of ids.slice(0, 3)) await approveMedia(admin, id);
