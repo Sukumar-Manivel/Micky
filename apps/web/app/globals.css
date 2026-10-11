@@ -1,0 +1,233 @@
+@import "tailwindcss";
+
+/*
+  Self-hosted fonts (SIL OFL, see public/fonts/OFL.txt). No third-party font request, so
+  no tracking and they work offline once cached. Two files per family: the basic Latin set
+  and the extended set, which contains the ₹ sign (U+20B9). `unicode-range` makes the browser
+  download the extended file only when a page actually uses one of its characters.
+*/
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  src: url("/fonts/atkinson-hyperlegible-next-latin-wght-normal.woff2") format("woff2-variations");
+  font-weight: 200 800;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  src: url("/fonts/atkinson-hyperlegible-next-latin-ext-wght-normal.woff2") format("woff2-variations");
+  font-weight: 200 800;
+  font-display: swap;
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Archivo";
+  src: url("/fonts/archivo-latin-standard-normal.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-stretch: 62% 125%;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Archivo";
+  src: url("/fonts/archivo-latin-ext-standard-normal.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-stretch: 62% 125%;
+  font-display: swap;
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/*
+  Design tokens. Every colour in the app comes from these variables, so dark mode is just a
+  second set of values. Tailwind v4 reads `@theme inline` and generates utilities such as
+  `bg-surface`, `text-muted` and `border-line` from them.
+
+  Palette: a cool "monsoon slate" base, one urgent accent (signal) used only for live and
+  incident cues, and one trust colour (verified) for positive verification signals.
+*/
+:root {
+  --page: #f3f6f8;
+  --surface: #ffffff;
+  --sunken: #e8eef2;
+  --ink: #13212c;
+  --muted: #52636f;
+  --line: #d3dce2;
+  --signal: #d9381e;
+  --signal-ink: #ffffff;
+  --signal-soft: #fde9e4;
+  --verified: #0b7a69;
+  --verified-soft: #dff3ee;
+  --caution: #8a5a00;
+  --caution-soft: #fdf1d6;
+  --danger: #b42318;
+  --danger-soft: #fde7e5;
+  --focus: #1d6fd1;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #0c141b;
+    --surface: #131e27;
+    --sunken: #0f1820;
+    --ink: #e6edf2;
+    --muted: #93a5b2;
+    --line: #253543;
+    --signal: #ff6247;
+    --signal-ink: #1a0905;
+    --signal-soft: #3a1710;
+    --verified: #3cc4ae;
+    --verified-soft: #0f2e2a;
+    --caution: #f0b54a;
+    --caution-soft: #34270c;
+    --danger: #ff7b6e;
+    --danger-soft: #3a1513;
+    --focus: #6aa8ff;
+    color-scheme: dark;
+  }
+}
+
+@theme inline {
+  --color-page: var(--page);
+  --color-surface: var(--surface);
+  --color-sunken: var(--sunken);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-signal: var(--signal);
+  --color-signal-ink: var(--signal-ink);
+  --color-signal-soft: var(--signal-soft);
+  --color-verified: var(--verified);
+  --color-verified-soft: var(--verified-soft);
+  --color-caution: var(--caution);
+  --color-caution-soft: var(--caution-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-focus: var(--focus);
+  --font-sans: "Atkinson Hyperlegible Next", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Archivo", "Atkinson Hyperlegible Next", ui-sans-serif, sans-serif;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 1.0625rem;
+  line-height: 1.55;
+}
+
+/* Headlines: Archivo squeezed to a condensed width, like a broadcast lower-third. */
+.font-display {
+  font-family: var(--font-display);
+  font-stretch: 72%;
+  letter-spacing: -0.005em;
+  line-height: 1.02;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* One consistent, highly visible keyboard focus ring everywhere. */
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ---------- Viewfinder motif (landing hero, media frames) ---------- */
+.viewfinder {
+  --corner: 22px;
+  --stroke: 3px;
+  background:
+    linear-gradient(currentColor, currentColor) top left / var(--corner) var(--stroke),
+    linear-gradient(currentColor, currentColor) top left / var(--stroke) var(--corner),
+    linear-gradient(currentColor, currentColor) top right / var(--corner) var(--stroke),
+    linear-gradient(currentColor, currentColor) top right / var(--stroke) var(--corner),
+    linear-gradient(currentColor, currentColor) bottom left / var(--corner) var(--stroke),
+    linear-gradient(currentColor, currentColor) bottom left / var(--stroke) var(--corner),
+    linear-gradient(currentColor, currentColor) bottom right / var(--corner) var(--stroke),
+    linear-gradient(currentColor, currentColor) bottom right / var(--stroke) var(--corner);
+  background-repeat: no-repeat;
+}
+
+/* The recording dot. Blinks only to signal something is live right now. */
+@keyframes rec-blink {
+  0%, 60% { opacity: 1; }
+  61%, 100% { opacity: 0.25; }
+}
+.rec-dot {
+  display: inline-block;
+  width: 0.6em;
+  height: 0.6em;
+  border-radius: 9999px;
+  background: var(--signal);
+}
+.rec-dot[data-live="true"] {
+  animation: rec-blink 1.4s steps(1) infinite;
+}
+
+/* ---------- Preview watermark ---------- */
+/* The overlay text drifts around the frame so it can't simply be cropped out of a recording. */
+@keyframes watermark-drift {
+  0% { transform: translate(4%, 8%) rotate(-12deg); }
+  25% { transform: translate(52%, 30%) rotate(-12deg); }
+  50% { transform: translate(18%, 70%) rotate(-12deg); }
+  75% { transform: translate(60%, 82%) rotate(-12deg); }
+  100% { transform: translate(4%, 8%) rotate(-12deg); }
+}
+.watermark-drift {
+  animation: watermark-drift 24s linear infinite;
+}
+
+/* ---------- Skeleton shimmer ---------- */
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.skeleton {
+  background: var(--sunken);
+  border-radius: 6px;
+  animation: skeleton-pulse 1.6s ease-in-out infinite;
+}
+
+/* Respect people who asked their device for less motion. The watermark still shows, but static. */
+@media (prefers-reduced-motion: reduce) {
+  .rec-dot[data-live="true"],
+  .skeleton {
+    animation: none;
+  }
+  .watermark-drift {
+    animation-duration: 120s;
+  }
+}
+
+/* Leaflet sits inside our themed surfaces; keep its controls readable in dark mode. */
+.leaflet-container {
+  font-family: var(--font-sans);
+  background: var(--sunken);
+}
+.leaflet-container a {
+  color: var(--focus);
+}
+.map-pin {
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: var(--signal);
+  border: 3px solid #fff;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.4);
+}
+.map-pin[data-kind="drag"] {
+  width: 26px;
+  height: 26px;
+  background: var(--focus);
+}
+
+dialog::backdrop {
+  background: rgb(8 14 19 / 0.6);
+}

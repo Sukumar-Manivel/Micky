@@ -1,0 +1,43 @@
+[project]
+name = "firstframe-verifier"
+version = "0.1.0"
+description = "FirstFrame verifier: AI-likelihood score, C2PA provenance and perceptual hashes for uploaded media."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+# Runtime dependencies (no ML). Exact pins live in requirements.txt.
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "python-multipart>=0.0.18",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.4",
+  "pillow>=11.0",
+  "ImageHash>=4.3",
+  "c2pa-python>=0.38,<0.39",
+]
+
+[project.optional-dependencies]
+# The AI detector. torch must come from the CPU index (see requirements-ml.txt).
+ml = ["torch>=2.5", "transformers>=4.46"]
+dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.6", "cryptography>=43"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning:app.*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "N", "SIM", "RUF", "ANN"]
+ignore = [
+  "ANN401", # Any is fine for library-shaped JSON
+  "S101",   # assert is fine in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "ANN"]

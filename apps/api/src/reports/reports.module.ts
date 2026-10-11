@@ -1,5 +1,10 @@
 import { Module } from '@nestjs/common';
+import { ReportsController } from './reports.controller.js';
+import { ReportsService } from './reports.service.js';
 
-// Placeholder: filled in by the Reports builder (see docs/BUILD_PLAN.md).
-@Module({})
+/** Public grievance / takedown reports. Admins handle them in AdminModule. */
+@Module({
+  controllers: [ReportsController],
+  providers: [ReportsService],
+})
 export class ReportsModule {}

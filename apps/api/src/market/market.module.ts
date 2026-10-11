@@ -1,5 +1,11 @@
 import { Module } from '@nestjs/common';
+import { MarketController } from './market.controller.js';
+import { MarketService } from './market.service.js';
 
-// Placeholder: filled in by the Market builder (see docs/BUILD_PLAN.md).
-@Module({})
+/** Browse approved media and incidents (news channels and admins). See docs/API.md, "Marketplace". */
+@Module({
+  controllers: [MarketController],
+  providers: [MarketService],
+  exports: [MarketService],
+})
 export class MarketModule {}

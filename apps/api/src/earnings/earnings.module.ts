@@ -1,5 +1,10 @@
 import { Module } from '@nestjs/common';
+import { EarningsController } from './earnings.controller.js';
+import { EarningsService } from './earnings.service.js';
 
-// Placeholder: filled in by the Earnings builder (see docs/BUILD_PLAN.md).
-@Module({})
+/** Uploader balance, ledger, sales and payout requests. */
+@Module({
+  controllers: [EarningsController],
+  providers: [EarningsService],
+})
 export class EarningsModule {}

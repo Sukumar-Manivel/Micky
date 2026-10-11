@@ -1,0 +1,6 @@
+# The AI detector. Install torch from the PyTorch CPU index FIRST so pip doesn't
+# pull the multi-GB CUDA build from PyPI:
+#   pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.5,<3"
+#   pip install -r requirements-ml.txt
+# (The Dockerfile does exactly this.)
+transformers==5.19.0
