@@ -1,0 +1,47 @@
+# Dependabot: weekly pull requests for outdated or vulnerable dependencies (REVIEW L9).
+# Workflow actions are pinned to commit SHAs; Dependabot updates the SHA and the "# vX.Y.Z"
+# comment together. Every PR runs the full CI, including the browser e2e suite.
+# Minor and patch updates are grouped per ecosystem, so there are few PRs to review.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    groups:
+      actions: { patterns: ["*"] }
+
+  - package-ecosystem: npm
+    directory: /apps/api
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    groups:
+      api-minor-patch: { update-types: [minor, patch] }
+
+  - package-ecosystem: npm
+    directory: /apps/web
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    groups:
+      web-minor-patch: { update-types: [minor, patch] }
+
+  - package-ecosystem: npm
+    directory: /e2e
+    schedule: { interval: monthly }
+    groups:
+      e2e: { patterns: ["*"] }
+
+  - package-ecosystem: pip
+    directory: /services/verifier
+    schedule: { interval: weekly, day: monday }
+    groups:
+      verifier-minor-patch: { update-types: [minor, patch] }
+
+  # Base images in the Dockerfiles (node, python).
+  - package-ecosystem: docker
+    directories: [/apps/api, /apps/web, /services/verifier]
+    schedule: { interval: weekly, day: monday }
+
+  # postgres/redis/caddy images in the production compose file.
+  - package-ecosystem: docker-compose
+    directory: /infra
+    schedule: { interval: monthly }

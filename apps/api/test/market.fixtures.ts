@@ -2,7 +2,7 @@
 // Uploads and processing are built by another module, so these helpers insert
 // "already processed" rows directly and write small fake preview files.
 import type { NestExpressApplication } from '@nestjs/platform-express';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -19,6 +19,8 @@ import {
   users,
   verifications,
 } from '../src/db/schema.js';
+import { deliveryKey, deliveryMimeType } from '../src/processing/delivery.js';
+import { previewKeys } from '../src/processing/preview-plan.js';
 import { StorageService, storageKeys } from '../src/storage/storage.service.js';
 import { db } from './helpers.js';
 
@@ -34,6 +36,12 @@ export const CHENNAI = { lat: 13.0827, lng: 80.2707 }; // about 550 km from Koch
 export const FAKE_JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 0xff, 0xd9]);
 export const FAKE_SEGMENT = Buffer.from('G-fake-mpeg-ts-segment');
 export const FAKE_ORIGINAL = Buffer.from('original-file-bytes');
+/** The buyer's copy (metadata removed by the worker in real life): different bytes from the original. */
+export const FAKE_DELIVERY = Buffer.from('delivery-copy-bytes');
+export const FAKE_DELIVERY_SHA256 = createHash('sha256').update(FAKE_DELIVERY).digest('hex');
+/** A newsroom's own marked rendition (the worker renders it on first view in real life). */
+export const FAKE_VIEWER_SEGMENT = Buffer.from('G-viewer-marked-segment');
+export const FAKE_VIEWER_JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 1, 0xff, 0xd9]);
 
 export interface TestUser {
   accessToken: string;
@@ -117,7 +125,7 @@ export async function insertMedia(
   app: NestExpressApplication,
   uploaderId: string,
   values: Partial<MediaInsert> = {},
-  opts: { withPreview?: boolean } = {},
+  opts: { withPreview?: boolean; withDelivery?: boolean } = {},
 ) {
   const id = randomUUID();
   const type = values.type ?? 'VIDEO';
@@ -166,7 +174,21 @@ export async function insertMedia(
       aiModel: 'test-model',
       framesScored: 8,
       c2paStatus: 'absent',
-      metadata: { device: 'Pixel 8', gps: [KOCHI.lat, KOCHI.lng] },
+      metadata: {
+        device: 'Pixel 8',
+        gps: [KOCHI.lat, KOCHI.lng],
+        ...(opts.withDelivery === false
+          ? {}
+          : {
+              delivery: {
+                key: deliveryKey(row),
+                sha256: FAKE_DELIVERY_SHA256,
+                sizeBytes: FAKE_DELIVERY.length,
+                mimeType: deliveryMimeType(row.mimeType),
+                createdAt: now.toISOString(),
+              },
+            }),
+      },
       signals: [{ code: 'AI_SCORE_LOW', level: 'positive', message: 'Low AI likelihood' }],
       riskLevel: 'LOW',
     });
@@ -203,6 +225,7 @@ async function writeStorageFiles(app: NestExpressApplication, row: typeof media.
   };
   try {
     await put(row.originalKey, FAKE_ORIGINAL, row.mimeType);
+    await put(deliveryKey(row), FAKE_DELIVERY, deliveryMimeType(row.mimeType));
     if (!withPreview) return;
     await put(storageKeys.thumbnail(row.id), FAKE_JPEG, 'image/jpeg');
     if (row.type === 'PHOTO') {
@@ -223,6 +246,46 @@ async function writeStorageFiles(app: NestExpressApplication, row: typeof media.
     ].join('\n');
     await put(storageKeys.hlsPlaylist(row.id), playlist, 'application/vnd.apple.mpegurl');
     await put(`${storageKeys.hlsDir(row.id)}/seg_000.ts`, FAKE_SEGMENT, 'video/mp2t');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Writes the files of one newsroom's marked rendition, as the worker would on its
+ * first view, so stream tests do not need a worker.
+ */
+export async function writeViewerRendition(app: NestExpressApplication, row: typeof media.$inferSelect, viewerId: string) {
+  const storage = app.get(StorageService);
+  const dir = await mkdtemp(path.join(tmpdir(), 'ff-viewer-'));
+  try {
+    const put = async (key: string, body: Buffer | string, type: string) => {
+      const file = path.join(dir, path.basename(key));
+      await writeFile(file, body);
+      await storage.putFile(key, file, type);
+    };
+    if (row.type === 'PHOTO') {
+      await put(previewKeys.viewerImage(row.id, viewerId), FAKE_VIEWER_JPEG, 'image/jpeg');
+      return;
+    }
+    const base = previewKeys.viewerDir(row.id, viewerId);
+    await put(`${base}/seg_000.ts`, FAKE_VIEWER_SEGMENT, 'video/mp2t');
+    await put(`${base}/seg_001.ts`, FAKE_VIEWER_SEGMENT, 'video/mp2t');
+    const playlist = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      '#EXT-X-TARGETDURATION:4',
+      '#EXT-X-MEDIA-SEQUENCE:0',
+      '#EXT-X-PLAYLIST-TYPE:VOD',
+      '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000000',
+      '#EXTINF:4.0,',
+      'seg_000.ts',
+      '#EXTINF:0.8,',
+      'seg_001.ts',
+      '#EXT-X-ENDLIST',
+      '',
+    ].join('\n');
+    await put(previewKeys.viewerPlaylist(row.id, viewerId), playlist, 'application/vnd.apple.mpegurl');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -249,6 +312,9 @@ export async function insertOrder(
       providerOrderId: `mock_${randomUUID()}`,
       paidAt: new Date(),
       ...values,
+      // A captured payment must name its payment id (orders_captured_has_payment).
+      providerPaymentId:
+        values.providerPaymentId ?? ((values.status ?? 'PAID') === 'PAID' ? `mock_pay_${randomUUID()}` : null),
     })
     .returning();
   return row;

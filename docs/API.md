@@ -58,7 +58,10 @@ interface MediaOwnerView {
   verification: VerificationView | null;
 }
 
-/** What a news channel sees in the marketplace. Never contains the uploader's identity. */
+/**
+ * What a news channel sees in the marketplace. Never contains the uploader's identity.
+ * latitude/longitude are rounded to 3 decimals (about 100 m) for channels; admins get the exact point.
+ */
 interface MediaMarketView {
   id: string; type: MediaType; title: string; description: string | null; category: Category;
   latitude: number; longitude: number; locationName: string | null;
@@ -67,28 +70,46 @@ interface MediaMarketView {
   incidentId: string | null;
   priceNonExclusive: number; priceExclusive: number;
   availability: { nonExclusive: boolean; exclusive: boolean };
-  purchased: { orderId: string; licenseType: LicenseType } | null; // the caller's own paid purchase, if any
+  // The caller's own paid purchase, if any. fileSha256 = SHA-256 of the file the buyer downloads
+  // (the delivery copy without identifying metadata); null while that copy is being prepared.
+  purchased: { orderId: string; licenseType: LicenseType; fileSha256: string | null } | null;
   verification: VerificationView; // metadata is {} for channels
   distanceKm?: number;            // only when lat/lng were given
 }
 
 interface IncidentView {
-  id: string; title: string; category: Category; latitude: number; longitude: number;
+  id: string; title: string; category: Category; latitude: number; longitude: number; // rounded to 3 decimals
   locationName: string | null; firstSeenAt: string; lastSeenAt: string;
   mediaCount: number; uploaderCount: number; trendScore: number;
   thumbnailUrl: string | null;    // thumbnail of its newest approved media
 }
 
+type OrderStatus =
+  | 'CREATED'        // checkout open, payable until expiresAt
+  | 'PAID'           // captured, licence granted
+  | 'FAILED'         // payment declined (the buyer may retry inside the same checkout)
+  | 'EXPIRED'        // nobody paid before expiresAt; a late payment is refunded
+  | 'REFUND_PENDING' // money captured but no licence can be granted; refund job running
+  | 'REFUNDED'       // payment refunded (by us, or in the Razorpay dashboard); licence revoked
+  | 'REFUND_FAILED'  // the refund job gave up; an admin must retry it
+  | 'DISPUTED';      // chargeback opened; licence revoked, uploader credit reversed
+
 interface OrderView {
-  id: string; status: 'CREATED' | 'PAID' | 'FAILED'; licenseType: LicenseType;
-  amount: number; currency: 'INR'; createdAt: string; paidAt: string | null; downloadCount: number;
+  id: string; status: OrderStatus; licenseType: LicenseType;
+  amount: number; currency: 'INR'; createdAt: string;
+  expiresAt: string;              // until when an unpaid checkout can be paid
+  paidAt: string | null; refundedAt: string | null;
+  statusReason: string | null;    // why it is not (or no longer) PAID, e.g. "licence sold meanwhile"
+  downloadCount: number;
   media: { id: string; title: string; type: MediaType; thumbnailUrl: string | null };
 }
 
 interface LedgerEntryView {
-  id: string; type: 'SALE_CREDIT' | 'PAYOUT_DEBIT' | 'PAYOUT_REVERSAL' | 'ADJUSTMENT';
+  id: string;
+  type: 'SALE_CREDIT' | 'SALE_REVERSAL' | 'SALE_REINSTATEMENT' | 'PAYOUT_DEBIT' | 'PAYOUT_REVERSAL' | 'ADJUSTMENT';
   amount: number; note: string | null; createdAt: string;
-  mediaTitle: string | null;      // for sale credits
+  availableAt: string;            // when it counts towards the withdrawable balance (sale credits are held)
+  mediaTitle: string | null;      // for sale rows
 }
 
 interface PayoutView {
@@ -124,7 +145,7 @@ The refresh token lives only in the httpOnly cookie `ff_refresh` (path `/api/v1/
 
 | Field | Type | Rules |
 |---|---|---|
-| `file` | binary, required | Video: mp4/mov/webm (≤ `MAX_VIDEO_BYTES`, default 500 MB). Photo: jpeg/png/heic/webp (≤ 25 MB). The file type is checked from its magic bytes, not the extension |
+| `file` | binary, required | Video: mp4/mov/webm (≤ `MAX_VIDEO_BYTES`, default 500 MB, ≤ 4K, ≤ `MAX_VIDEO_DURATION_SEC`). Photo: jpeg/png/heic/webp (≤ 25 MB, ≤ 50 megapixels: **413** from the header, before anything is decoded). The file type is checked from its magic bytes, not the extension |
 | `title` | string, required | 5–120 characters |
 | `description` | string, optional | ≤ 2000 characters |
 | `category` | Category, required | |
@@ -135,11 +156,19 @@ The refresh token lives only in the httpOnly cookie `ff_refresh` (path `/api/v1/
 | `priceNonExclusive`, `priceExclusive` | paise, optional | Defaults by type. Allowed range ₹100–₹1,00,000; exclusive ≥ non-exclusive |
 | `rightsConfirmed` | `'true'`, required | Uploader confirms they shot it, it is real, and they accept the uploader licence |
 
-Duplicate check: if the same file checksum was already uploaded by anyone, reject with 409 `This file has already been uploaded`. Uploads that ended in `FAILED` are excluded, so an uploader can retry the same file after a processing failure.
+Duplicate check: if the same file checksum was already uploaded by anyone, reject with 409 `This file has already been uploaded`. Uploads that ended in `FAILED` are excluded, so an uploader can retry the same file after a processing failure. The checksum is always the **original's**, not the delivery copy's.
+
+Per-uploader limits (**429**): uploads still processing, uploads per hour, and bytes per day (`UPLOAD_LIMITS` in `media.service.ts`).
+
+**Processing limits (worker):** every FFmpeg/ffprobe call on an upload passes `-max_pixels 50000000` (decompression bombs) and has a timeout (probe 30 s, frame 60 s, render/copy 5 min). Videos over 4K or longer than `MAX_VIDEO_DURATION_SEC`, and photos over 50 MP, end `FAILED` without retries.
+
+**Delivery copy:** the worker also writes the file buyers download, `originals/<id>/delivery.<ext>`: same audio/video/image data, with identifying metadata removed (video: `-map_metadata -1 -map_chapters -1 -c copy`, data tracks dropped; photos: every EXIF/XMP/IPTC/comment block dropped except orientation and capture time; HEIC re-encoded as JPEG). Its SHA-256, size and type are stored in the verification's admin-only `metadata.delivery`. The untouched original stays admin-only.
 
 ## Marketplace (MarketModule)
 
 Access: CHANNEL with an **approved** organisation, or ADMIN. Only `APPROVED` media is listed, and the uploader's identity is never exposed.
+
+Coordinates of media and incidents are rounded to 3 decimals (about 100 m) for channels. The radius filter, `sort=nearest` and `distanceKm` are computed from the rounded point too, so radius queries cannot triangulate the exact one. Admins see exact coordinates; the owner sees them in `GET /me/media`.
 
 | Method | Path | Request → Response |
 |---|---|---|
@@ -152,31 +181,51 @@ Access: CHANNEL with an **approved** organisation, or ADMIN. Only `APPROVED` med
 
 | Method | Path | Access | Response |
 |---|---|---|---|
-| POST | `/market/media/:id/preview` | approved CHANNEL, or ADMIN (any status), or the owner UPLOADER | `{ kind: 'hls', playlistUrl, expiresAt, watermarkText }` for video, or `{ kind: 'image', imageUrl, expiresAt, watermarkText }` for photos. URLs are absolute and signed (10 min). `watermarkText` is e.g. `"Preview · <organisation> · <date>"`; the player overlays it, moving |
-| GET | `/stream/:token/index.m3u8` | public (token) | HLS playlist (`application/vnd.apple.mpegurl`). Segment and key URIs are relative, so they resolve to the routes below with the same token |
-| GET | `/stream/:token/:segment` | public (token) | `.ts` segment (`video/mp2t`). Names must match `^seg_\d{3,5}\.ts$` |
-| GET | `/stream/:token/key.bin` | public (token) | 16-byte AES-128 key (`application/octet-stream`), `Cache-Control: no-store` |
-| GET | `/stream/:token/image.jpg` | public (token) | Watermarked preview image |
+| POST | `/market/media/:id/preview` | approved CHANNEL, or ADMIN (any status), or the owner UPLOADER | **200** `{ kind: 'hls', playlistUrl, expiresAt, watermarkText }` for video, or `{ kind: 'image', imageUrl, expiresAt, watermarkText }` for photos. **202** `{ kind: 'preparing', retryAfterSec }` + `Retry-After` while the worker renders this newsroom's marked copy (first view; the API waits up to 20 s first). **409** while processing has not produced a preview. **410** for a channel when the media was sold exclusively to someone else. 30/min |
+| GET | `/stream/:token/index.m3u8` | public (playlist token, 2 min) | HLS playlist (`application/vnd.apple.mpegurl`, `no-store`). Its key URI and segment URIs are rewritten to `../<token>/key.bin` and `../<token>/seg_NNN.ts`, each with its own token |
+| GET | `/stream/:token/:segment` | public (file token, 10 min) | `.ts` segment (`video/mp2t`). Names must match `^seg_\d{3,5}\.ts$` |
+| GET | `/stream/:token/key.bin` | public (key token, 2 min) | 16-byte AES-128 key (`application/octet-stream`), `Cache-Control: no-store` |
+| GET | `/stream/:token/image.jpg` | public (file token) | Watermarked preview image |
 | GET | `/files/thumb/:token` | public (token) | Watermarked thumbnail JPEG, `Cache-Control: private, max-age=3600` |
-| GET | `/files/download/:token` | public (token) | The **original** file, as an attachment. Token from `/orders/:id/download` only |
+| GET | `/files/download/:token` | public (single-use token from `GET /orders/:id/download`) | The **delivery copy** (identifying metadata removed), as an attachment, with `X-Content-SHA256` (hex) and `Repr-Digest` (RFC 9530). See below |
 
-Signed token purposes (see `SigningService`): `stream` `{ m: mediaId, u: userId }`, `thumb` `{ m }`, `download` `{ o: orderId }`.
+**What a preview contains:**
+- Video: at most `min(PREVIEW_MAX_SECONDS (30), 40% of the clip)`, at least 1 s. Clips under 30 s: 360p with a denser, more opaque tiled mark; longer clips: 480p.
+- Photos: at most 640 px on the long side.
+- Owner and admins get the generic preview (tiled "MICKY PREVIEW").
+- Each newsroom gets **its own rendition** with `ORGANISATION · <first 8 hex of its user id>` burned into the pixels on top, rendered by the worker on its first view and cached for 7 days (`previews/<id>/v/<userId>/`). The token's `u` decides which rendition is served, so a shared link shows the sharer's name.
+- `watermarkText` (`"Preview · <organisation> · <code> · <date> IST"`) is also drawn by the player, moving.
+- After an exclusive sale, previews are closed for every newsroom except the buyer (410 on POST, 404 on the file routes).
+
+**Tokens** (see `SigningService`), every stream token carries `{ m: mediaId, u: viewerId }` and every request re-checks access for that viewer:
+- `stream-playlist` (2 min), `stream-key` (2 min, minted when the playlist is served), `stream` (segments and image, 10 min). Each opens only its own routes.
+- `thumb` `{ m }`.
+- `download` `{ o: orderId, u?: buyerId }`, see below.
+
+**Downloads** (`GET /files/download/:token`):
+- The link must be redeemed within **2 minutes** of being issued and works **once** (a Redis `SET NX` on the token's hash, claimed before the first byte): reuse gives **410**. A link that names another buyer gives 404.
+- `HEAD` gives **405**, so link checkers cannot use up a link.
+- At most 20 downloads per order per hour (**429**), and 20 requests per minute per IP.
+- The order must be PAID and the media not REMOVED (404).
+- **409** "being prepared" (and a `prepare-delivery` job is queued) if the delivery copy does not exist yet. The untouched original is never served.
+- `downloadCount` goes up when every byte of the file went into the response, not when a link is issued.
 
 ## Orders and payments (OrdersModule)
 
 | Method | Path | Access | Request → Response |
 |---|---|---|---|
-| POST | `/orders` | approved CHANNEL | `{ mediaId, licenseType }` → **201** `CheckoutView` (below). 409 if the licence is unavailable or already bought by this channel |
-| POST | `/orders/:id/verify` | buyer | `{ razorpayPaymentId, razorpaySignature }` → `OrderView` (PAID). Signature checked as documented in RESEARCH.md |
-| POST | `/orders/:id/mock-pay` | buyer, only when `PAYMENTS_PROVIDER=mock` | → `OrderView` (PAID). 404 when the provider is not mock |
+| POST | `/orders` | approved CHANNEL | `{ mediaId, licenseType }` → **201** `CheckoutView` (below). 409 if the licence is unavailable or already bought by this channel. An unpaid checkout of the same licence at the same price with ≥ 10 min left is returned again instead of a new one |
+| POST | `/orders/:id/verify` | buyer | `{ razorpayPaymentId, razorpaySignature }` → `OrderView`. Signature checked as documented in RESEARCH.md, then the payment is fetched from Razorpay: the licence is granted only if it is `captured`, for the order's amount, in INR. Still `authorized` → the order is returned `CREATED` (the `payment.captured` webhook grants it; poll `GET /orders/:id`). 409 (with "full refund … requested") if the payment cannot be kept: licence sold meanwhile, media taken down, checkout expired, wrong amount. 502 if Razorpay cannot be reached |
+| POST | `/orders/:id/mock-pay` | buyer, only when `PAYMENTS_PROVIDER=mock` | → `OrderView` (PAID). 409 + refund like `/verify` when the payment cannot be kept. 404 when the provider is not mock |
 | GET | `/orders` | CHANNEL | `?page&pageSize&status?` → `Paginated<OrderView>` |
 | GET | `/orders/:id` | buyer or ADMIN | → `OrderView` |
-| GET | `/orders/:id/download` | buyer, PAID only | → `{ url, expiresAt, fileName }`, a signed absolute URL to `/files/download/:token`, valid 15 min. Increments `downloadCount` |
-| POST | `/payments/razorpay/webhook` | public, signature-checked | Razorpay event → **200** `{ received: true }`. Idempotent via `webhook_events` |
+| GET | `/orders/:id/download` | buyer, PAID only | → `{ url, expiresAt, fileName }`, a signed absolute URL to `/files/download/:token`, bound to the buyer, single-use and valid 2 min. `downloadCount` counts completed downloads only (incremented by the file route). REFUNDED and DISPUTED orders get 409 |
+| POST | `/payments/razorpay/webhook` | public, signature-checked | Razorpay event → **200** `{ received: true, status }`. 400 on a bad signature; 500 (retried by Razorpay) if processing failed |
 
 ```ts
 interface CheckoutView {
   orderId: string; amount: number; currency: 'INR'; provider: 'razorpay' | 'mock';
+  expiresAt: string;                             // pay before this (30 min); later payments are refunded
   razorpay?: { keyId: string; orderId: string }; // pass to Razorpay Checkout
   description: string;                           // e.g. "Non-exclusive licence: Fire near Gandhipuram"
 }
@@ -185,29 +234,61 @@ interface CheckoutView {
 **Licence rules:**
 - **Exclusive** can be bought only if the media has **no** paid orders yet. After it is paid, the media is no longer available to anyone else, and `exclusiveSold = true`.
 - **Non-exclusive** can be bought by many channels, but not after an exclusive sale. Each channel can buy each media once.
-- **Two buyers racing for an exclusive licence:** marking an order PAID locks the media row (`SELECT ... FOR UPDATE`) and re-checks the rules. If the licence was taken in the meantime, the order is marked FAILED and flagged for refund in the logs.
+- **Two buyers racing for an exclusive licence:** marking an order PAID locks the media row (`SELECT ... FOR UPDATE`) and re-checks the rules. If the licence was taken in the meantime, the order becomes `REFUND_PENDING` and a refund is issued automatically (below).
+- **Database backstops:** partial unique indexes allow at most one PAID exclusive order per media and one PAID order per (buyer, media), whatever the code does.
 
 **Marking an order PAID happens in exactly one service method, used by verify, mock-pay and the webhook, in one transaction:**
-1. Set the order to PAID (only if it is CREATED: idempotent).
-2. Insert a `SALE_CREDIT` ledger entry of `uploaderShare` (the unique index makes this idempotent).
-3. Update `exclusiveSold`.
+1. Lock the media row and re-read the order. Already PAID with this payment → unchanged. Already PAID with *another* payment → that second payment is refunded.
+2. If the buyer paid after `expiresAt`, or the licence rules now fail, set `REFUND_PENDING` and record a refund. Otherwise:
+3. Set the order to PAID (from CREATED, FAILED or EXPIRED).
+4. Insert a `SALE_CREDIT` of `uploaderShare` with `availableAt = paidAt + EARNINGS_HOLD_DAYS` (unique index: one credit per order).
+5. Update `exclusiveSold`.
+
+**Refunds** (money captured that cannot be kept):
+- A `refunds` row is written in the same transaction that decides it (unique per payment id), then a BullMQ job `refund` (queue `commerce`, job id from the payment id) calls the gateway's refund API. The gateway call is itself idempotent (it finds an earlier refund with our receipt).
+- 6 attempts with exponential backoff from 30 s. Then the refund is `FAILED`, the order `REFUND_FAILED`, and it waits in the admin's refund queue. Housekeeping (every 5 min) re-queues refunds stuck in PENDING.
+- The refund completes when the job sees `processed`, or with the `refund.processed` webhook. The order becomes `REFUNDED`.
+- Unpaid checkouts expire after 30 minutes (`EXPIRED`, set by housekeeping). A payment made after that is refunded; a delayed webhook for a payment made *before* it still grants the licence.
+
+**Webhook events handled** (subscribe to exactly these):
+
+| Event | Effect |
+|---|---|
+| `payment.captured`, `order.paid` | `markPaid`. Ignored unless the payment status is `captured`, the order is a Razorpay order and `amount` is present. Wrong amount or currency → refunded, never granted |
+| `payment.failed` | CREATED → FAILED |
+| `refund.processed` | Our own refund → order REFUNDED. A refund made in the Razorpay dashboard → order REFUNDED, licence revoked, `SALE_REVERSAL` written |
+| `refund.failed` | Our refund → FAILED, order REFUND_FAILED |
+| `payment.dispute.created` / `.action_required` / `.under_review` / `.lost` | PAID → DISPUTED, licence revoked, `SALE_REVERSAL` written |
+| `payment.dispute.won` | DISPUTED → PAID, `SALE_REINSTATEMENT` written |
+
+Deduplication: the `x-razorpay-event-id` header is the `webhook_events` primary key, and the SHA-256 of the signed raw body is a unique column too, because the header is not covered by the signature. Every handler is also idempotent on its own.
 
 ## Uploader earnings (EarningsModule), UPLOADER only
 
 | Method | Path | Request → Response |
 |---|---|---|
-| PUT | `/me/payout-details` | `{ upiId }` (format `name@bank`, 3–100 chars) → `{ user: UserView }` |
-| GET | `/me/earnings` | → `{ balance, totalEarned, totalPaidOut, pendingPayouts, salesCount, recent: LedgerEntryView[] (last 10) }` (paise) |
+| PUT | `/me/payout-details` | `{ upiId, currentPassword }` (format `name@bank`, 3–100 chars), 10/min → `{ user: UserView, payoutDetails: PayoutDetailsView }`. 403 if the password is wrong. Changing an existing UPI ID pauses payouts for `PAYOUT_COOLDOWN_HOURS` (24) and is recorded in `payout_detail_changes` (old/new ID, IP, user agent). Setting the first one has no pause |
+| GET | `/me/earnings` | → `{ balance, available, onHold, nextReleaseAt, holdDays, totalEarned, totalPaidOut, pendingPayouts, salesCount, payoutDetails: PayoutDetailsView, recent: LedgerEntryView[] (last 10) }` (paise). `balance` = SUM(ledger), may be negative after a refund; `available` = rows whose `availableAt` has passed |
 | GET | `/me/ledger` | `?page&pageSize` → `Paginated<LedgerEntryView>` |
-| GET | `/me/sales` | `?page&pageSize` → `Paginated<{ orderId, mediaId, mediaTitle, licenseType, amount, uploaderShare, paidAt, buyerOrganization }>` |
-| POST | `/me/payouts` | `{ amount }` (paise, ≥ `MIN_PAYOUT_PAISE`, ≤ balance, UPI ID set) → **201** `PayoutView`. Debits the ledger immediately, in one transaction that locks the user's ledger (`pg_advisory_xact_lock`) to prevent double spending |
+| GET | `/me/sales` | `?page&pageSize` → `Paginated<{ orderId, mediaId, mediaTitle, licenseType, status: 'PAID' \| 'REFUNDED' \| 'DISPUTED', amount, uploaderShare, paidAt, buyerOrganization }>` |
+| POST | `/me/payouts` | `{ amount }` (paise, ≥ `MIN_PAYOUT_PAISE`, ≤ **available** balance, UPI ID set, not inside the cooling-off after a UPI change) → **201** `PayoutView`. Debits the ledger immediately, in one transaction that locks the user's ledger (`pg_advisory_xact_lock`) to prevent double spending |
+
+```ts
+interface PayoutDetailsView {
+  upiId: string | null;
+  changedAt: string | null;          // last change from a previous UPI ID
+  payoutsAllowedFrom: string | null; // set while payouts are paused after a change
+}
+```
+
+**Hold period:** a sale credit becomes available `EARNINGS_HOLD_DAYS` (7) after payment. A refund or chargeback writes a negative `SALE_REVERSAL` with the same `availableAt` as the credit, so inside the hold the two cancel out, and after the hold (or after a payout) the balance can go negative; later sales net it off.
 | GET | `/me/payouts` | `?page&pageSize` → `Paginated<PayoutView>` |
 
 ## Admin (AdminModule), ADMIN only
 
 | Method | Path | Request → Response |
 |---|---|---|
-| GET | `/admin/stats` | → `{ users: { uploaders, channels, pendingChannels }, media: { processing, inReview, approved, rejected }, orders: { paid, revenue, platformFees }, payouts: { requested, requestedAmount }, reports: { open } }` |
+| GET | `/admin/stats` | → `{ users: { uploaders, channels, pendingChannels }, media: { processing, inReview, approved, rejected }, orders: { paid, revenue, platformFees, disputed }, refunds: { pending, failed }, payouts: { requested, requestedAmount }, reports: { open } }` |
 | GET | `/admin/review-queue` | `?page&pageSize&risk?` → `Paginated<MediaOwnerView & { uploader: { id, name, email } }>`, oldest first, status IN_REVIEW. Verification includes full metadata |
 | POST | `/admin/media/:id/approve` | `{ note? }` → `MediaOwnerView`. IN_REVIEW → APPROVED, then `IncidentsService.recompute` and `RealtimeService.emitToChannels({ type: 'media.approved', ... })` |
 | POST | `/admin/media/:id/reject` | `{ note }` (required, 3–500 chars) → `MediaOwnerView` |
@@ -215,9 +296,24 @@ interface CheckoutView {
 | GET | `/admin/channels` | `?status=PENDING\|APPROVED\|REJECTED&page&pageSize` → `Paginated<UserView>` |
 | POST | `/admin/channels/:userId/approve` | → `UserView` |
 | POST | `/admin/channels/:userId/reject` | `{ note }` → `UserView` |
-| GET | `/admin/payouts` | `?status&page&pageSize` → `Paginated<PayoutView & { uploader: { id, name, email } }>` |
+| GET | `/admin/payouts` | `?status&page&pageSize` → `Paginated<PayoutView & { uploader: { id, name, email }, upiChangedAt: string \| null, upiChangedRecently: boolean }>`. `upiChangedRecently`: the UPI ID changed within 7 days before the request (check before paying) |
 | POST | `/admin/payouts/:id/mark-paid` | `{ reference }` → `PayoutView` |
 | POST | `/admin/payouts/:id/reject` | `{ note }` → `PayoutView` + a `PAYOUT_REVERSAL` ledger entry that returns the money |
+| GET | `/admin/refunds` | `?status=PENDING\|PROCESSED\|FAILED&page&pageSize` → `Paginated<AdminRefundView>`, oldest first |
+| POST | `/admin/refunds/:id/retry` | → `{ id, status: 'PENDING' }`. FAILED (or stuck PENDING) → PENDING, order REFUND_FAILED → REFUND_PENDING, job queued again. 409 if already processed |
+| GET | `/admin/orders` | `?status&page&pageSize` → `Paginated<OrderView & { providerPaymentId, buyer: { id, email, organization } }>`, newest first (e.g. `status=DISPUTED`) |
+| POST | `/admin/ledger-adjustments` | `{ uploaderId? \| uploaderEmail?, amount (paise, ≠ 0, ±₹1,00,000), note (3–500, required) }` → **201** `LedgerEntryView & { uploaderId }`. Writes an `ADJUSTMENT` with the admin as `created_by`. The only way to correct a balance: the ledger is append-only (a trigger refuses UPDATE/DELETE) |
+
+```ts
+interface AdminRefundView {
+  id: string; status: 'PENDING' | 'PROCESSED' | 'FAILED'; amount: number; reason: string;
+  providerPaymentId: string; providerRefundId: string | null; attempts: number; lastError: string | null;
+  createdAt: string; processedAt: string | null;
+  order: { id: string; status: OrderStatus; licenseType: LicenseType };
+  media: { id: string; title: string };
+  buyer: { id: string; email: string; organization: string | null };
+}
+```
 | GET | `/admin/reports` | `?status&page&pageSize` → `Paginated<Report>` |
 | POST | `/admin/reports/:id/resolve` | `{ resolution, removeMedia?: boolean }` → Report |
 | POST | `/admin/reports/:id/dismiss` | `{ resolution }` → Report |

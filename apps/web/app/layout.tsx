@@ -6,11 +6,11 @@ import { ToastProvider } from '@/components/toast';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: { default: 'FirstFrame — eyewitness footage for newsrooms', template: '%s | FirstFrame' },
+  title: { default: 'Micky — eyewitness footage for newsrooms', template: '%s | Micky' },
   description:
     'Witnesses upload verified photos and videos of incidents in Tamil Nadu. Newsrooms preview and license them. Witnesses get paid.',
-  applicationName: 'FirstFrame',
-  appleWebApp: { capable: true, title: 'FirstFrame', statusBarStyle: 'default' },
+  applicationName: 'Micky',
+  appleWebApp: { capable: true, title: 'Micky', statusBarStyle: 'default' },
 };
 
 export const viewport: Viewport = {
@@ -26,7 +26,7 @@ export default function RootLayout({ children }: LayoutProps<'/'>) {
   return (
     <html lang="en-IN" className="h-full antialiased">
       <head>
-        {/* Sets window.__FIRSTFRAME_CONFIG__ (the API address) from the container's environment.
+        {/* Sets window.__MICKY_CONFIG__ (the API address) from the container's environment.
             Deliberately blocking: it is tiny, and it must run before the app's code. See lib/config.ts. */}
         {/* eslint-disable-next-line @next/next/no-sync-scripts */}
         <script src="/runtime-config.js" />
@@ -50,7 +50,7 @@ function SiteFooter() {
   return (
     <footer className="border-t border-line">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-3 px-4 py-8 text-sm text-muted sm:flex-row sm:items-center sm:justify-between">
-        <p>FirstFrame. Made in Tamil Nadu for witnesses and newsrooms.</p>
+        <p>Micky. Made in Tamil Nadu for witnesses and newsrooms.</p>
         <nav aria-label="Footer" className="flex flex-wrap gap-x-5 gap-y-2">
           <Link href="/terms" className="hover:text-ink">
             Terms

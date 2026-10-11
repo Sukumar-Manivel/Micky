@@ -8,11 +8,18 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { Roles } from '../common/auth.decorators.js';
+import {
+  type AuthUser,
+  CurrentUser,
+  Roles,
+} from '../common/auth.decorators.js';
 import {
   DismissReportDto,
+  LedgerAdjustmentDto,
   ListChannelsQuery,
+  ListOrdersAdminQuery,
   ListPayoutsQuery,
+  ListRefundsQuery,
   ListReportsQuery,
   MarkPayoutPaidDto,
   OptionalNoteDto,
@@ -112,6 +119,32 @@ export class AdminController {
     @Body() dto: RequiredNoteDto,
   ) {
     return this.admin.rejectPayout(id, dto.note);
+  }
+
+  // ---- Refunds, disputes, ledger adjustments ----
+
+  @Get('refunds')
+  listRefunds(@Query() query: ListRefundsQuery) {
+    return this.admin.listRefunds(query);
+  }
+
+  @Post('refunds/:id/retry')
+  @HttpCode(200)
+  retryRefund(@Param('id', ParseUUIDPipe) id: string) {
+    return this.admin.retryRefund(id);
+  }
+
+  @Get('orders')
+  listOrders(@Query() query: ListOrdersAdminQuery) {
+    return this.admin.listOrders(query);
+  }
+
+  @Post('ledger-adjustments')
+  createAdjustment(
+    @CurrentUser() admin: AuthUser,
+    @Body() dto: LedgerAdjustmentDto,
+  ) {
+    return this.admin.createAdjustment(admin, dto);
   }
 
   // ---- Grievance reports ----

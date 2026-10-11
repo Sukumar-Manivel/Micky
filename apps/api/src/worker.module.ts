@@ -6,6 +6,7 @@ import { DbModule } from './db/db.module.js';
 import { IncidentsModule } from './incidents/incidents.module.js';
 import { MediaProcessingService } from './processing/media-processing.service.js';
 import { MediaProcessor } from './processing/media.processor.js';
+import { PreviewRenderProcessor } from './processing/preview-render.processor.js';
 import { ProcessingModule } from './processing/processing.module.js';
 import { ProcessingScheduler } from './processing/processing.scheduler.js';
 import { VerifierClient } from './processing/verifier.client.js';
@@ -30,7 +31,7 @@ import { StorageModule } from './storage/storage.service.js';
     IncidentsModule,
     ProcessingModule,
   ],
-  providers: [VerifierClient, MediaProcessingService, MediaProcessor, ProcessingScheduler],
+  providers: [VerifierClient, MediaProcessingService, MediaProcessor, PreviewRenderProcessor, ProcessingScheduler],
 })
 export class WorkerModule {}
 

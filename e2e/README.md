@@ -1,4 +1,4 @@
-# FirstFrame browser end-to-end tests
+# Micky browser end-to-end tests
 
 Playwright tests that drive the real product in Chromium against the whole stack: PostgreSQL, Redis, the Python verifier, the NestJS API, the BullMQ worker and the Next.js web app, with `PAYMENTS_PROVIDER=mock`. Nothing in the app is mocked except the payment gateway.
 
@@ -13,7 +13,7 @@ npx playwright show-report   # HTML report, with traces and videos of failures
 ```
 
 You need the following:
-- PostgreSQL on `localhost:5432`, with a role `firstframe/firstframe` that can create databases.
+- PostgreSQL on `localhost:5432`, with a role `micky/micky` that can create databases.
 - Redis on `localhost:6379`.
 - `ffmpeg` on the PATH.
 - The verifier's venv at `services/verifier/.venv`, or set `E2E_PYTHON` to a Python that has `services/verifier/requirements.txt` installed.
@@ -24,7 +24,7 @@ You need the following:
 1. Generates the test footage with ffmpeg into `.fixtures/`:
    - small H.264/AAC MP4s with GPS and capture-time tags, unique per run;
    - a text file named `.mp4`.
-2. Drops and recreates the database `firstframe_e2e`, flushes Redis db 13, then runs the compiled migrations and the admin seed.
+2. Drops and recreates the database `micky_e2e`, flushes Redis db 13, then runs the compiled migrations and the admin seed.
 3. Starts the verifier (`:8310`, no AI model), the API (`:4310`), the worker and the web standalone server (`:3310`), and waits until each is ready. Logs go to `.stack/<name>.log`.
 
 Teardown stops every process group. The database is kept so you can inspect a failed run. `E2E_DROP_DB=1` drops it too.

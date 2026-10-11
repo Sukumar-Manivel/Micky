@@ -13,6 +13,7 @@ const ADMIN_LINKS = [
   { href: '/admin/review', label: 'Review queue' },
   { href: '/admin/channels', label: 'Newsrooms' },
   { href: '/admin/payouts', label: 'Payouts' },
+  { href: '/admin/refunds', label: 'Refunds' },
   { href: '/admin/reports', label: 'Reports' },
 ] as const;
 

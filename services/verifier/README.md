@@ -1,4 +1,4 @@
-# FirstFrame verifier
+# Micky verifier
 
 Internal Python service that the API worker calls for every upload. It returns
 **evidence**, not a verdict:
@@ -73,9 +73,9 @@ loading wait up to `MODEL_LOAD_WAIT_SECONDS` and then answer with `ai.available=
 ## Docker
 
 ```bash
-docker build -t firstframe-verifier services/verifier             # bakes in the model
-docker build --build-arg PRELOAD_MODEL=false -t firstframe-verifier services/verifier
-docker run --rm -p 8000:8000 -e INTERNAL_TOKEN=... firstframe-verifier
+docker build -t micky-verifier services/verifier             # bakes in the model
+docker build --build-arg PRELOAD_MODEL=false -t micky-verifier services/verifier
+docker run --rm -p 8000:8000 -e INTERNAL_TOKEN=... micky-verifier
 ```
 
 `python:3.12-slim`, CPU-only torch from the PyTorch index, non-root user (uid 10001),

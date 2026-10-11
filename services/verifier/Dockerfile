@@ -1,7 +1,7 @@
-# FirstFrame verifier: FastAPI + CPU-only PyTorch, for linux/arm64 (Oracle Ampere) and amd64.
+# Micky verifier: FastAPI + CPU-only PyTorch, for linux/arm64 (Oracle Ampere) and amd64.
 #
-# Build:  docker build -t firstframe-verifier services/verifier
-# Run:    docker run --rm -p 8000:8000 -e INTERNAL_TOKEN=... firstframe-verifier
+# Build:  docker build -t micky-verifier services/verifier
+# Run:    docker run --rm -p 8000:8000 -e INTERNAL_TOKEN=... micky-verifier
 #
 # The model weights (~345 MB) are downloaded at BUILD time into the image, at a
 # pinned commit, so the running container never needs Hugging Face (and can run

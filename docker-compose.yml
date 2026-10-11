@@ -1,7 +1,7 @@
-# FirstFrame: full stack for LOCAL development / demos.
+# Micky: full stack for LOCAL development / demos.
 #
 #   docker compose up --build            # build images and start everything
-#   docker compose run --rm seed         # create the admin (admin@firstframe.local)
+#   docker compose run --rm seed         # create the admin (admin@micky.local)
 #   open http://localhost:3000           # web     (API: http://localhost:4000/api/v1/health)
 #   docker compose down                  # stop    (add -v to also delete the data volumes)
 #
@@ -15,7 +15,7 @@
 # PostgreSQL and Redis are NOT published to the host (a native Postgres/Redis on
 # 5432/6379 keeps working). Set PG_PORT / REDIS_PORT and uncomment `ports` to reach them.
 
-name: firstframe
+name: micky
 
 x-api-env: &api-env
   NODE_ENV: development
@@ -23,7 +23,7 @@ x-api-env: &api-env
   PUBLIC_API_URL: http://localhost:${API_PORT:-4000}
   WEB_URL: http://localhost:${WEB_PORT:-3000}
   CORS_ORIGINS: http://localhost:${WEB_PORT:-3000}
-  DATABASE_URL: postgresql://firstframe:firstframe@postgres:5432/firstframe
+  DATABASE_URL: postgresql://micky:micky@postgres:5432/micky
   REDIS_URL: redis://redis:6379
   # Development-only secrets (the API refuses short/missing secrets when NODE_ENV=production).
   JWT_ACCESS_SECRET: dev-only-jwt-secret-change-me-0123456789abcdef
@@ -36,11 +36,11 @@ x-api-env: &api-env
   PAYMENTS_PROVIDER: mock
   PLATFORM_FEE_PERCENT: "30"
   WORKER_CONCURRENCY: "1"
-  ADMIN_EMAIL: admin@firstframe.local
+  ADMIN_EMAIL: admin@micky.local
   ADMIN_PASSWORD: change-this-admin-password
 
 x-api-image: &api-image
-  image: firstframe-api:local
+  image: micky-api:local
   build:
     context: ./apps/api
 
@@ -48,14 +48,14 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: firstframe
-      POSTGRES_PASSWORD: firstframe
-      POSTGRES_DB: firstframe
+      POSTGRES_USER: micky
+      POSTGRES_PASSWORD: micky
+      POSTGRES_DB: micky
     volumes:
       - pgdata:/var/lib/postgresql/data
     # ports: ["${PG_PORT:-55432}:5432"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U firstframe -d firstframe"]
+      test: ["CMD-SHELL", "pg_isready -U micky -d micky"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -74,7 +74,7 @@ services:
       retries: 20
 
   verifier:
-    image: firstframe-verifier:local
+    image: micky-verifier:local
     build:
       context: ./services/verifier
       args:
@@ -140,7 +140,7 @@ services:
         condition: service_started
 
   web:
-    image: firstframe-web:local
+    image: micky-web:local
     build:
       context: ./apps/web
       args:

@@ -4,7 +4,7 @@
 COMPOSE ?= docker compose
 SCRIPTS := $(wildcard scripts/*.sh)
 
-.PHONY: help up down logs ps seed migrate config clean lint-infra e2e e2e-install
+.PHONY: help up down logs ps seed migrate config clean lint-infra test-backups e2e e2e-install
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -21,7 +21,7 @@ logs: ## Follow logs of api, worker and web
 ps: ## Show container status and health
 	$(COMPOSE) ps
 
-seed: ## Create the admin user (admin@firstframe.local)
+seed: ## Create the admin user (admin@micky.local)
 	$(COMPOSE) run --rm seed
 
 migrate: ## Apply database migrations
@@ -35,6 +35,9 @@ config: ## Validate both compose files (prod with placeholder values)
 
 clean: ## Stop the stack AND delete its volumes (database, uploads)
 	$(COMPOSE) down -v
+
+test-backups: ## Encrypt/restore round trip of the backup scripts (local Postgres, age, rclone)
+	scripts/test-backups.sh
 
 lint-infra: ## shellcheck + actionlint + hadolint (if installed)
 	shellcheck -x $(SCRIPTS)

@@ -29,6 +29,50 @@ export interface PaymentProvider {
 
   /** Checks a webhook's signature over the exact bytes that were received. */
   verifyWebhookSignature(rawBody: Buffer, signature: string): boolean;
+
+  /**
+   * Reads a payment from the gateway. Used by /verify: the checkout signature proves the
+   * payment was *authorised*, not that the money was *captured*, so the licence is only
+   * granted once the gateway itself says `captured` for the right amount.
+   */
+  fetchPayment(paymentId: string): Promise<ProviderPayment>;
+
+  /**
+   * Refunds a captured payment in full (`amountPaise` = what was captured).
+   * Must be idempotent: calling it again for the same payment and `receipt` returns the
+   * refund created the first time instead of refunding twice (the job may be retried
+   * after a crash between the gateway call and our database write).
+   */
+  refund(input: RefundInput): Promise<ProviderRefund>;
+}
+
+export type ProviderPaymentStatus =
+  'created' | 'authorized' | 'captured' | 'refunded' | 'failed';
+
+export interface ProviderPayment {
+  id: string;
+  /** The gateway order this payment belongs to. */
+  orderId: string | null;
+  status: ProviderPaymentStatus;
+  /** Paise. */
+  amount: number;
+  currency: string;
+  /** When the buyer paid (used to judge whether the checkout had expired). */
+  createdAt: Date;
+}
+
+export interface RefundInput {
+  paymentId: string;
+  amountPaise: number;
+  /** Our refunds.id: stored at the gateway so a retried job finds its own refund. */
+  receipt: string;
+  notes: Record<string, string>;
+}
+
+export interface ProviderRefund {
+  refundId: string;
+  /** `pending` refunds finish later and are reported by the `refund.processed` webhook. */
+  status: 'pending' | 'processed' | 'failed';
 }
 
 export interface CreateProviderOrderInput {

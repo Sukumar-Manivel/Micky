@@ -87,7 +87,7 @@ test('a duplicate upload and a fake video are rejected with a clear message', as
   }
 
   await tryUpload(CLIPS.duplicate, 'Same clip uploaded again');
-  await expect(page.getByRole('alert').filter({ hasText: 'This exact file has already been uploaded to FirstFrame.' })).toBeVisible();
+  await expect(page.getByRole('alert').filter({ hasText: 'This exact file has already been uploaded to Micky.' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Uploaded. Thank you.' })).toHaveCount(0);
 
   // A text file renamed .mp4 passes the browser's check (it trusts the extension) but not the API's magic bytes.
@@ -142,6 +142,14 @@ test('an exclusive licence stops a second sale', async ({ browser }) => {
   await expect(late.getByText('Not available: already licensed to a newsroom.')).toBeVisible();
   await expect(late.getByRole('button', { name: /^Buy / })).toHaveCount(0);
   await expect(late.getByRole('button', { name: 'Download original' })).toHaveCount(0);
+  // The preview is closed for other newsrooms too: the exclusive buyer paid for the story being theirs alone.
+  await expect(late.getByText('its preview is closed', { exact: false })).toBeVisible();
+  await expect(late.getByLabel(`Preview of ${title}`)).toHaveCount(0);
+  // The exclusive buyer keeps its preview (202 while its marked copy is first rendered).
+  const own = await call('POST', `/market/media/${mediaId}/preview`, { token: first.token });
+  expect([200, 202]).toContain(own.status);
+  const closed = await call('POST', `/market/media/${mediaId}/preview`, { token: second.token });
+  expect(closed.status).toBe(410);
 
   // Same through the API, for both licence types.
   for (const licenseType of ['NON_EXCLUSIVE', 'EXCLUSIVE']) {

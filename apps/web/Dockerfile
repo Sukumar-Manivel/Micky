@@ -1,7 +1,7 @@
-# FirstFrame web app (Next.js PWA). Builds for linux/amd64 and linux/arm64.
+# Micky web app (Next.js PWA). Builds for linux/amd64 and linux/arm64.
 #
-#   docker build -t firstframe-web apps/web
-#   docker run -p 3000:3000 -e PUBLIC_API_URL=https://api.example.com firstframe-web
+#   docker build -t micky-web apps/web
+#   docker run -p 3000:3000 -e PUBLIC_API_URL=https://api.example.com micky-web
 #
 # Where the browser finds the API:
 #   PUBLIC_API_URL (runtime, preferred): set on the container; served to the browser by

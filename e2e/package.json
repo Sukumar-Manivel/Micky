@@ -1,8 +1,8 @@
 {
-  "name": "@firstframe/e2e",
+  "name": "@micky/e2e",
   "version": "0.0.1",
   "private": true,
-  "description": "Browser end-to-end tests for FirstFrame (Playwright): the whole stack, like a real user",
+  "description": "Browser end-to-end tests for Micky (Playwright): the whole stack, like a real user",
   "type": "module",
   "scripts": {
     "test": "playwright test",

@@ -31,7 +31,7 @@ def _sign_jpeg(jpeg: bytes) -> bytes:
         return x509.Name(
             [
                 x509.NameAttribute(NameOID.COMMON_NAME, cn),
-                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "FirstFrame Test"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Micky Test"),
             ]
         )
 
@@ -77,7 +77,7 @@ def _sign_jpeg(jpeg: bytes) -> bytes:
 
     signer = c2pa.Signer.from_info(c2pa.C2paSignerInfo(c2pa.C2paSigningAlg.ES256, chain, private, None))
     manifest = {
-        "claim_generator_info": [{"name": "firstframe-test", "version": "1.0"}],
+        "claim_generator_info": [{"name": "micky-test", "version": "1.0"}],
         "title": "test.jpg",
         "assertions": [
             {
@@ -130,8 +130,8 @@ def test_error_for_garbage() -> None:
 def test_valid_signed_jpeg(signed_jpeg: bytes) -> None:
     result = check_c2pa(io.BytesIO(signed_jpeg), "image/jpeg")
     assert result.status == "valid"
-    assert result.issuer == "FirstFrame Test"
-    assert result.claim_generator == "firstframe-test/1.0"
+    assert result.issuer == "Micky Test"
+    assert result.claim_generator == "micky-test/1.0"
 
 
 def test_invalid_when_pixels_are_tampered(signed_jpeg: bytes) -> None:
@@ -139,4 +139,4 @@ def test_invalid_when_pixels_are_tampered(signed_jpeg: bytes) -> None:
     tampered[-200] ^= 0xFF  # flip bits inside the image data, after the manifest
     result = check_c2pa(io.BytesIO(bytes(tampered)), "image/jpeg")
     assert result.status == "invalid"
-    assert result.issuer == "FirstFrame Test"  # still reported, for the admin
+    assert result.issuer == "Micky Test"  # still reported, for the admin

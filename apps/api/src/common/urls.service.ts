@@ -1,4 +1,5 @@
 import { Global, Injectable, Module } from '@nestjs/common';
+import { randomBytes } from 'node:crypto';
 import { AppConfig } from '../config/app-config.js';
 import { SigningService } from './signing.service.js';
 
@@ -6,11 +7,12 @@ import { SigningService } from './signing.service.js';
 export const TOKEN = {
   thumb: 'thumb', //    { m: mediaId }
   stream: 'stream', //  { m: mediaId, u: userId }
-  download: 'download', // { o: orderId }
+  download: 'download', // { o: orderId, u: buyerId, n: nonce }
 } as const;
 
 export const STREAM_TTL_SEC = 10 * 60;
-export const DOWNLOAD_TTL_SEC = 15 * 60;
+/** Download links are single-use and must be redeemed quickly (review M3). */
+export const DOWNLOAD_TTL_SEC = 120;
 
 /** Builds the absolute, signed URLs the API hands out to browsers. */
 @Injectable()
@@ -41,8 +43,13 @@ export class UrlService {
     return { base: `${this.base}/stream/${token}/`, expiresAt: new Date(Date.now() + STREAM_TTL_SEC * 1000) };
   }
 
-  downloadUrl(orderId: string): { url: string; expiresAt: Date } {
-    const token = this.signing.sign(TOKEN.download, { o: orderId }, DOWNLOAD_TTL_SEC);
+  /**
+   * Single-use download link bound to the buyer. The random nonce makes every link
+   * unique, so two clicks in the same second don't produce the same (already used) link.
+   */
+  downloadUrl(orderId: string, buyerId: string): { url: string; expiresAt: Date } {
+    const payload = { o: orderId, u: buyerId, n: randomBytes(9).toString('base64url') };
+    const token = this.signing.sign(TOKEN.download, payload, DOWNLOAD_TTL_SEC);
     return {
       url: `${this.base}/files/download/${token}`,
       expiresAt: new Date(Date.now() + DOWNLOAD_TTL_SEC * 1000),

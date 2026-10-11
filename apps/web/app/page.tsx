@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import { ButtonLink } from '@/components/ui';
 
-export const metadata: Metadata = { title: { absolute: 'FirstFrame — eyewitness footage for newsrooms' } };
+export const metadata: Metadata = { title: { absolute: 'Micky — eyewitness footage for newsrooms' } };
 
 // A Server Component: no JavaScript is shipped for this page's content, only HTML and CSS.
 export default function HomePage() {
@@ -24,7 +24,7 @@ function Hero() {
           The first frame of every story is on someone’s phone.
         </h1>
         <p className="max-w-[34rem] text-lg text-muted sm:text-xl">
-          When a fire, accident or flood happens, reporters arrive late. FirstFrame lets the people who were there share
+          When a fire, accident or flood happens, reporters arrive late. Micky lets the people who were there share
           checked footage with newsrooms, and get paid for it.
         </p>
         <div className="flex flex-col gap-3 sm:flex-row">

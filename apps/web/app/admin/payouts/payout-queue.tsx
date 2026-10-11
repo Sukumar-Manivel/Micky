@@ -112,6 +112,12 @@ function PayoutCard({ payout: p, onChanged }: { payout: AdminPayout; onChanged: 
               {copied ? 'Copied' : 'Copy'}
             </Button>
           </div>
+          {p.upiChangedRecently ? (
+            <p className="text-sm font-semibold text-caution" role="note">
+              Check first: the UPI ID was changed {p.upiChangedAt ? formatDateTime(p.upiChangedAt) : 'recently'}. Confirm with the uploader by
+              email before sending money to a new ID.
+            </p>
+          ) : null}
           {p.reference ? <p className="text-sm text-muted">Reference: <span className="font-mono">{p.reference}</span></p> : null}
           {p.note ? <p className="text-sm text-muted">Note: {p.note}</p> : null}
           {p.processedAt ? <p className="text-sm text-muted">Processed {formatDateTime(p.processedAt)}</p> : null}

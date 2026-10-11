@@ -1,4 +1,5 @@
 import {
+  BadGatewayException,
   BadRequestException,
   ConflictException,
   Inject,
@@ -6,7 +7,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { and, count, desc, eq, gt, ne, sql } from 'drizzle-orm';
+import { and, count, desc, eq, gt, inArray, lt, ne, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 import type { AuthUser } from '../common/auth.decorators.js';
 import { priceFor, splitSale } from '../common/money.js';
@@ -14,11 +15,17 @@ import { offsetOf, type Paginated, paginated } from '../common/pagination.js';
 import { UrlService } from '../common/urls.service.js';
 import { AppConfig } from '../config/app-config.js';
 import { type Database, InjectDb } from '../db/db.module.js';
-import { ledgerEntries, media, orders } from '../db/schema.js';
+import { media, orders } from '../db/schema.js';
+import {
+  writeSaleCredit,
+  writeSaleReinstatement,
+  writeSaleReversal,
+} from '../earnings/ledger.js';
+import { checkoutTtlMs, saleCreditHoldMs } from '../earnings/money-policy.js';
+import { deliveryFileName } from '../common/views.js';
 import { licenceBlocker, licenceLabel } from './licence-rules.js';
 import {
   type CheckoutView,
-  downloadFileName,
   type OrderMediaRow,
   type OrderRow,
   type OrderView,
@@ -35,14 +42,37 @@ import {
   type PaymentProvider,
 } from './payments/payment-provider.js';
 import { RazorpayProvider } from './payments/razorpay.provider.js';
+import { EXPIRY_SWEEP_GRACE_MS } from './refunds.constants.js';
+import { RefundsService } from './refunds.service.js';
 
-/** A checkout that was started but not paid is reused for this long instead of creating a new one. */
-const REUSE_CHECKOUT_MS = 30 * 60 * 1000;
+/**
+ * An unpaid checkout is reused (instead of creating a new one) only while at least this
+ * much of its payment window is left, so the buyer always has time to finish paying.
+ */
+const REUSE_MIN_REMAINING_MS = 10 * 60 * 1000;
 
-/** Result of markPaid. It never throws for business outcomes, so the webhook can always answer 200. */
+/** The payment as markPaid needs it. */
+export interface CapturedPayment {
+  id: string;
+  /** When the buyer paid, according to the gateway; decides whether the checkout had expired. */
+  paidAt: Date;
+}
+
+/**
+ * Result of markPaid. It never throws for business outcomes, so the webhook can always answer 200.
+ * `refund_pending`: the money was captured but cannot be kept; a refund has been queued.
+ */
 export type MarkPaidResult =
   | { outcome: 'paid' | 'already_paid'; order: OrderRow }
-  | { outcome: 'licence_unavailable'; order: OrderRow; reason: string };
+  | { outcome: 'refund_pending'; order: OrderRow; reason: string };
+
+/** Order states in which the order's own payment was captured and is being (or was) given back or disputed. */
+const REVOKED_STATES = [
+  'REFUND_PENDING',
+  'REFUNDED',
+  'REFUND_FAILED',
+  'DISPUTED',
+] as const;
 
 /** Media columns used by the order views. */
 const ORDER_MEDIA_COLUMNS = {
@@ -61,6 +91,7 @@ export class OrdersService {
     @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
     private readonly config: AppConfig,
     private readonly urls: UrlService,
+    private readonly refunds: RefundsService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -89,7 +120,8 @@ export class OrdersService {
     const description = `${licenceLabel(dto.licenseType)}: ${item.title}`;
 
     // A buyer who closes the checkout and clicks "Buy" again should get the same
-    // order back, not a pile of abandoned orders. Only reuse it if the price is unchanged.
+    // order back, not a pile of abandoned orders. Only reuse it if the price is unchanged
+    // and enough of its payment window is left.
     const reusable = await this.db.query.orders.findFirst({
       where: and(
         eq(orders.buyerId, buyer.id),
@@ -98,7 +130,7 @@ export class OrdersService {
         eq(orders.status, 'CREATED'),
         eq(orders.amount, amount),
         eq(orders.provider, this.provider.name),
-        gt(orders.createdAt, new Date(Date.now() - REUSE_CHECKOUT_MS)),
+        gt(orders.expiresAt, new Date(Date.now() + REUSE_MIN_REMAINING_MS)),
       ),
       orderBy: desc(orders.createdAt),
     });
@@ -132,6 +164,8 @@ export class OrdersService {
         status: 'CREATED',
         provider: this.provider.name,
         providerOrderId,
+        // The quoted price is honoured until then. A payment made later is refunded.
+        expiresAt: new Date(Date.now() + checkoutTtlMs(this.config)),
       })
       .returning();
 
@@ -147,6 +181,7 @@ export class OrdersService {
       amount: order.amount,
       currency: 'INR',
       provider: this.provider.name,
+      expiresAt: order.expiresAt.toISOString(),
       ...(this.provider instanceof RazorpayProvider
         ? {
             razorpay: {
@@ -189,8 +224,49 @@ export class OrdersService {
       );
     }
 
+    // The signature proves the payment was *authorised*. Only the gateway can say the
+    // money was *captured*, and for how much (review M5).
+    let payment;
+    try {
+      payment = await this.provider.fetchPayment(dto.razorpayPaymentId);
+    } catch {
+      throw new BadGatewayException(
+        'We could not confirm your payment with the payment gateway yet. If you were charged, ' +
+          'the licence appears under Purchases within a few minutes; otherwise please try again.',
+      );
+    }
+    if (payment.orderId !== order.providerOrderId) {
+      this.logger.warn(
+        `Payment ${payment.id} belongs to ${payment.orderId}, not order ${order.id}`,
+      );
+      throw new BadRequestException(
+        'Payment verification failed: the payment belongs to another order',
+      );
+    }
+    if (payment.status !== 'captured') {
+      // Usually "authorized" for a moment before auto-capture: the payment.captured
+      // webhook grants the licence. The browser polls GET /orders/:id meanwhile.
+      this.logger.log(
+        `Order ${order.id}: payment ${payment.id} is ${payment.status}, not captured yet`,
+      );
+      return this.view(order.id);
+    }
+    if (payment.amount !== order.amount || payment.currency !== 'INR') {
+      await this.refundStrayPayment(
+        order,
+        { id: payment.id, amount: payment.amount },
+        `The payment of ${payment.amount} ${payment.currency} does not match the order amount`,
+      );
+      throw new ConflictException(
+        'The amount paid does not match the price of this licence. A full refund of your payment has been requested.',
+      );
+    }
+
     return this.viewOrThrow(
-      await this.markPaid(order.id, dto.razorpayPaymentId),
+      await this.markPaid(order.id, {
+        id: payment.id,
+        paidAt: payment.createdAt,
+      }),
     );
   }
 
@@ -202,7 +278,10 @@ export class OrdersService {
     if (order.provider !== 'mock')
       throw new NotFoundException('Order not found');
     return this.viewOrThrow(
-      await this.markPaid(order.id, `mock_pay_${randomUUID()}`),
+      await this.markPaid(order.id, {
+        id: `mock_pay_${randomUUID()}`,
+        paidAt: new Date(),
+      }),
     );
   }
 
@@ -214,22 +293,23 @@ export class OrdersService {
    *
    *  1. Lock the media row (SELECT ... FOR UPDATE). Every other markPaid for the same
    *     media now waits here until we commit, so the licence check below cannot race.
-   *  2. Re-read the order. If it is already PAID, return it unchanged (idempotent).
-   *  3. Re-check the licence rules. If the licence was sold in the meantime, mark the
-   *     order FAILED: the buyer was charged, so it is logged loudly for a refund.
+   *  2. Re-read the order. If it is already PAID by this payment, return it unchanged
+   *     (idempotent). A *different* payment for a PAID order is a double charge: refund it.
+   *  3. Check the payment was made before the checkout expired, and re-check the licence
+   *     rules. If either fails, the money cannot be kept: the order becomes REFUND_PENDING
+   *     and a refund is recorded in the same transaction (the job runs after commit).
    *  4. Mark the order PAID (conditional on it not being PAID yet).
-   *  5. Credit the uploader's share in the ledger. The partial unique index
-   *     "one SALE_CREDIT per order" makes a double credit impossible even if step 4
-   *     were somehow bypassed.
+   *  5. Credit the uploader's share, held until the hold period ends. The partial unique
+   *     index "one SALE_CREDIT per order" makes a double credit impossible.
    *  6. For an exclusive licence, set media.exclusiveSold.
    *
-   * A FAILED order can still become PAID: Razorpay sends `payment.failed` for a
-   * declined card, and the buyer may then retry and succeed in the same checkout.
-   * Money actually captured always wins, as long as the licence is still available.
+   * A FAILED order can still become PAID: Razorpay sends `payment.failed` for a declined
+   * card, and the buyer may then retry and succeed in the same checkout. An EXPIRED order
+   * can too, if the gateway says the buyer paid before it expired (a delayed webhook).
    */
   async markPaid(
     orderId: string,
-    providerPaymentId: string,
+    payment: CapturedPayment,
   ): Promise<MarkPaidResult> {
     const existing = await this.db.query.orders.findFirst({
       where: eq(orders.id, orderId),
@@ -238,7 +318,7 @@ export class OrdersService {
     if (!existing) throw new NotFoundException('Order not found');
 
     const result = await this.db.transaction(
-      async (tx): Promise<MarkPaidResult> => {
+      async (tx): Promise<MarkPaidResult & { refundPaymentId?: string }> => {
         // 1. Serialise all payments for this media.
         const [item] = await tx
           .select({
@@ -256,57 +336,106 @@ export class OrdersService {
           .select()
           .from(orders)
           .where(eq(orders.id, orderId));
-        if (order.status === 'PAID') {
-          if (order.providerPaymentId !== providerPaymentId) {
-            // Same order, a second successful payment: the buyer was charged twice.
-            this.logger.error(
-              `NEEDS REFUND: order ${order.id} is already paid by ${order.providerPaymentId}, ` +
-                `but payment ${providerPaymentId} also arrived for it`,
-            );
+
+        if (order.status === 'PAID' || isRevoked(order.status)) {
+          if (order.providerPaymentId === payment.id) {
+            return order.status === 'PAID'
+              ? { outcome: 'already_paid', order }
+              : {
+                  outcome: 'refund_pending',
+                  order,
+                  reason: order.statusReason ?? 'This order is being refunded',
+                };
           }
-          return { outcome: 'already_paid', order };
+          // Same order, a second captured payment: the buyer was charged twice.
+          const reason =
+            'This order had already been paid with another payment';
+          await this.refunds.record(tx, {
+            orderId: order.id,
+            provider: order.provider,
+            paymentId: payment.id,
+            amount: order.amount,
+            reason,
+          });
+          this.logger.warn(
+            `Order ${order.id} is ${order.status} with ${order.providerPaymentId}; refunding the extra payment ${payment.id}`,
+          );
+          return order.status === 'PAID'
+            ? { outcome: 'already_paid', order, refundPaymentId: payment.id }
+            : {
+                outcome: 'refund_pending',
+                order,
+                reason,
+                refundPaymentId: payment.id,
+              };
         }
 
-        // 3. Re-check the licence rules, excluding this order itself.
+        // 3. Was the checkout still open when the buyer paid? Are the licence rules still met?
+        const expired = payment.paidAt.getTime() > order.expiresAt.getTime();
         const state = await this.licenceState(tx, item.id, order.buyerId);
-        const reason = licenceBlocker(
-          {
-            mediaStatus: item.status,
-            exclusiveSold: item.exclusiveSold,
-            ...state,
-          },
-          order.licenseType,
-        );
+        const reason = expired
+          ? 'This checkout expired before the payment was made'
+          : licenceBlocker(
+              {
+                mediaStatus: item.status,
+                exclusiveSold: item.exclusiveSold,
+                ...state,
+              },
+              order.licenseType,
+            );
         if (reason) {
-          const [failed] = await tx
+          const [refunding] = await tx
             .update(orders)
-            .set({ status: 'FAILED', providerPaymentId })
-            .where(and(eq(orders.id, order.id), ne(orders.status, 'PAID')))
+            .set({
+              status: 'REFUND_PENDING',
+              providerPaymentId: payment.id,
+              statusReason: reason,
+            })
+            .where(
+              and(
+                eq(orders.id, order.id),
+                inArray(orders.status, ['CREATED', 'FAILED', 'EXPIRED']),
+              ),
+            )
             .returning();
-          return { outcome: 'licence_unavailable', order: failed, reason };
+          await this.refunds.record(tx, {
+            orderId: order.id,
+            provider: order.provider,
+            paymentId: payment.id,
+            amount: order.amount,
+            reason,
+          });
+          return {
+            outcome: 'refund_pending',
+            order: refunding,
+            reason,
+            refundPaymentId: payment.id,
+          };
         }
 
-        // 4. CREATED/FAILED -> PAID. The WHERE makes this a no-op if it is already PAID.
+        // 4. CREATED/FAILED/EXPIRED -> PAID. The WHERE makes this a no-op if it is already PAID.
+        const paidAt = new Date();
         const [paid] = await tx
           .update(orders)
-          .set({ status: 'PAID', paidAt: new Date(), providerPaymentId })
+          .set({
+            status: 'PAID',
+            paidAt,
+            providerPaymentId: payment.id,
+            statusReason: null,
+          })
           .where(and(eq(orders.id, order.id), ne(orders.status, 'PAID')))
           .returning();
 
-        // 5. Credit the uploader. ON CONFLICT targets the partial unique index.
-        await tx
-          .insert(ledgerEntries)
-          .values({
-            uploaderId: item.uploaderId,
-            type: 'SALE_CREDIT',
-            amount: paid.uploaderShare,
-            orderId: paid.id,
-            note: `${licenceLabel(paid.licenseType)} sale`,
-          })
-          .onConflictDoNothing({
-            target: ledgerEntries.orderId,
-            where: sql`${ledgerEntries.type} = 'SALE_CREDIT'`,
-          });
+        // 5. Credit the uploader, spendable only after the hold period (review H2).
+        await writeSaleCredit(tx, {
+          uploaderId: item.uploaderId,
+          orderId: paid.id,
+          amount: paid.uploaderShare,
+          note: `${licenceLabel(paid.licenseType)} sale`,
+          availableAt: new Date(
+            paidAt.getTime() + saleCreditHoldMs(this.config),
+          ),
+        });
 
         // 6. An exclusive sale takes the media off the market for everyone else.
         if (paid.licenseType === 'EXCLUSIVE') {
@@ -319,16 +448,48 @@ export class OrdersService {
       },
     );
 
+    if (result.refundPaymentId)
+      await this.refunds.enqueue(result.refundPaymentId);
     if (result.outcome === 'paid') {
-      this.logger.log(`Order ${orderId} PAID (payment ${providerPaymentId})`);
-    } else if (result.outcome === 'licence_unavailable') {
-      // The customer has been charged but gets nothing: a human must refund them.
-      this.logger.error(
-        `NEEDS REFUND: order ${orderId} was paid (payment ${providerPaymentId}, ` +
-          `${result.order.amount} paise) but the licence is no longer available: ${result.reason}`,
+      this.logger.log(`Order ${orderId} PAID (payment ${payment.id})`);
+    } else if (result.outcome === 'refund_pending' && result.refundPaymentId) {
+      this.logger.warn(
+        `Order ${orderId}: payment ${payment.id} (${result.order.amount} paise) cannot be kept: ` +
+          `${result.reason}. Refund queued.`,
       );
     }
-    return result;
+    const { refundPaymentId: _ignored, ...outcome } = result;
+    return outcome;
+  }
+
+  /**
+   * A captured payment we will not use at all (wrong amount or currency). Refunds it
+   * without changing the order, which stays payable.
+   */
+  async refundStrayPayment(
+    order: OrderRow,
+    payment: { id: string; amount: number },
+    reason: string,
+  ): Promise<void> {
+    if (!(payment.amount > 0)) {
+      this.logger.error(
+        `Stray payment ${payment.id} for order ${order.id} has no amount; refund it by hand`,
+      );
+      return;
+    }
+    await this.db.transaction((tx) =>
+      this.refunds.record(tx, {
+        orderId: order.id,
+        provider: order.provider,
+        paymentId: payment.id,
+        amount: payment.amount,
+        reason,
+      }),
+    );
+    await this.refunds.enqueue(payment.id);
+    this.logger.error(
+      `Payment ${payment.id} for order ${order.id} will be refunded: ${reason}`,
+    );
   }
 
   /** Marks an unpaid order FAILED (Razorpay `payment.failed` webhook). Returns false if nothing changed. */
@@ -341,6 +502,140 @@ export class OrdersService {
     return updated.length > 0;
   }
 
+  // ---------------------------------------------------------------------------
+  // After the sale: refunds made outside Micky, and chargebacks (review H2)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The payment of a PAID (or DISPUTED) order was refunded, e.g. by an admin in the
+   * Razorpay dashboard. The licence is revoked (downloads require PAID) and the uploader's
+   * credit is reversed. Idempotent.
+   */
+  async reverseSaleForRefund(
+    paymentId: string,
+    note: string,
+  ): Promise<'reversed' | 'unchanged' | 'unknown'> {
+    return this.revoke(paymentId, ['PAID', 'DISPUTED'], 'REFUNDED', note);
+  }
+
+  /** A chargeback was opened (or lost) for this payment. Idempotent. */
+  async openDispute(
+    paymentId: string,
+    note: string,
+  ): Promise<'reversed' | 'unchanged' | 'unknown'> {
+    return this.revoke(paymentId, ['PAID'], 'DISPUTED', note);
+  }
+
+  /**
+   * The platform won the chargeback: the buyer's licence and the uploader's share come
+   * back. Idempotent.
+   */
+  async disputeWon(
+    paymentId: string,
+  ): Promise<'reinstated' | 'unchanged' | 'unknown'> {
+    const result = await this.db.transaction(async (tx) => {
+      const [order] = await tx
+        .select()
+        .from(orders)
+        .where(eq(orders.providerPaymentId, paymentId))
+        .for('update');
+      if (!order) return 'unknown' as const;
+      if (order.status !== 'DISPUTED') return 'unchanged' as const;
+      // The money stays with us, so the uploader's share always comes back. The licence
+      // only comes back if that does not break the licence rules: while the order was
+      // DISPUTED the buyer may have bought the media again (or, after a non-exclusive
+      // dispute, someone bought it exclusively). The unique indexes would refuse PAID then.
+      const [conflict] = await tx
+        .select({ id: orders.id })
+        .from(orders)
+        .where(
+          and(
+            eq(orders.mediaId, order.mediaId),
+            eq(orders.status, 'PAID'),
+            ne(orders.id, order.id),
+            order.licenseType === 'EXCLUSIVE'
+              ? undefined
+              : sql`(${orders.buyerId} = ${order.buyerId} or ${orders.licenseType} = 'EXCLUSIVE')`,
+          ),
+        )
+        .limit(1);
+      await tx
+        .update(orders)
+        .set(
+          conflict
+            ? {
+                statusReason:
+                  'Chargeback won; the licence is held by a later order',
+              }
+            : { status: 'PAID', statusReason: null },
+        )
+        .where(eq(orders.id, order.id));
+      await writeSaleReinstatement(
+        tx,
+        order.id,
+        'Chargeback won: sale reinstated',
+      );
+      return 'reinstated' as const;
+    });
+    if (result === 'reinstated')
+      this.logger.log(`Dispute on payment ${paymentId} won: sale reinstated`);
+    return result;
+  }
+
+  private async revoke(
+    paymentId: string,
+    from: OrderRow['status'][],
+    to: 'REFUNDED' | 'DISPUTED',
+    note: string,
+  ): Promise<'reversed' | 'unchanged' | 'unknown'> {
+    const result = await this.db.transaction(async (tx) => {
+      const [order] = await tx
+        .select()
+        .from(orders)
+        .where(eq(orders.providerPaymentId, paymentId))
+        .for('update');
+      if (!order) return 'unknown' as const;
+      if (!from.includes(order.status)) return 'unchanged' as const;
+      const now = new Date();
+      await tx
+        .update(orders)
+        .set({
+          status: to,
+          statusReason: note,
+          ...(to === 'REFUNDED' ? { refundedAt: now } : { disputedAt: now }),
+        })
+        .where(eq(orders.id, order.id));
+      // The balance may go negative if the share was already paid out; future sales net it off.
+      await writeSaleReversal(tx, order.id, note);
+      return 'reversed' as const;
+    });
+    if (result === 'reversed')
+      this.logger.warn(
+        `Payment ${paymentId}: order ${to}, licence revoked and uploader credit reversed (${note})`,
+      );
+    return result;
+  }
+
+  /**
+   * Housekeeping: unpaid checkouts past their payment window become EXPIRED. A payment
+   * that still arrives for one is judged by when the buyer paid (see markPaid).
+   */
+  async expireStaleCheckouts(): Promise<number> {
+    const expired = await this.db
+      .update(orders)
+      .set({ status: 'EXPIRED', statusReason: 'Not paid in time' })
+      .where(
+        and(
+          eq(orders.status, 'CREATED'),
+          lt(orders.expiresAt, new Date(Date.now() - EXPIRY_SWEEP_GRACE_MS)),
+        ),
+      )
+      .returning({ id: orders.id });
+    if (expired.length)
+      this.logger.log(`Expired ${expired.length} unpaid checkout(s)`);
+    return expired.length;
+  }
+
   /** Looks up an order by the gateway's order id (webhooks only know that id). */
   async findByProviderOrderId(
     providerOrderId: string,
@@ -350,10 +645,20 @@ export class OrdersService {
     });
   }
 
+  /** Looks up an order by the payment that paid it (refund and dispute webhooks). */
+  async findByProviderPaymentId(
+    paymentId: string,
+  ): Promise<OrderRow | undefined> {
+    return this.db.query.orders.findFirst({
+      where: eq(orders.providerPaymentId, paymentId),
+    });
+  }
+
   private async viewOrThrow(result: MarkPaidResult): Promise<OrderView> {
-    if (result.outcome === 'licence_unavailable') {
+    if (result.outcome === 'refund_pending') {
       throw new ConflictException(
-        `${result.reason}. Your payment will be refunded in full; please contact support if it is not.`,
+        `${result.reason}. You will not be charged for it: a full refund of your payment has been requested. ` +
+          'Banks usually take 5–7 working days to show it; contact support if it has not arrived by then.',
       );
     }
     return this.view(result.order.id);
@@ -410,7 +715,7 @@ export class OrdersService {
 
     const item = await this.db.query.media.findFirst({
       where: eq(media.id, order.mediaId),
-      columns: { title: true, originalName: true, status: true },
+      columns: { title: true, originalKey: true, mimeType: true, status: true },
     });
     if (!item) throw new NotFoundException('Media not found');
     // Content taken down after a valid legal complaint must not be distributed further.
@@ -419,18 +724,13 @@ export class OrdersService {
         'This media has been taken down and cannot be downloaded',
       );
 
-    // Atomic increment in SQL (download_count = download_count + 1), so two parallel
-    // downloads cannot both read 3 and both write 4.
-    await this.db
-      .update(orders)
-      .set({ downloadCount: sql`${orders.downloadCount} + 1` })
-      .where(eq(orders.id, order.id));
-
-    const { url, expiresAt } = this.urls.downloadUrl(order.id);
+    // downloadCount is incremented by the file route only when the whole file was sent,
+    // so issuing a link is not counted as a download.
+    const { url, expiresAt } = this.urls.downloadUrl(order.id, order.buyerId);
     return {
       url,
       expiresAt: expiresAt.toISOString(),
-      fileName: downloadFileName(item.title, item.originalName),
+      fileName: deliveryFileName(item),
     };
   }
 
@@ -468,6 +768,7 @@ export class OrdersService {
   }
 
   /** Paid-order facts the licence rules need. Works inside or outside a transaction. */
+  // A DISPUTED order no longer holds a licence; a REFUNDED one neither. Only PAID counts.
   private async licenceState(
     db: Pick<Database, 'select'>,
     mediaId: string,
@@ -488,4 +789,8 @@ export class OrdersService {
       buyerHasPaid: row.buyerPaidCount > 0,
     };
   }
+}
+
+function isRevoked(status: OrderRow['status']): boolean {
+  return (REVOKED_STATES as readonly string[]).includes(status);
 }

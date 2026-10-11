@@ -1,11 +1,19 @@
 import { InjectQueue } from '@nestjs/bullmq';
 import { Injectable, Logger } from '@nestjs/common';
 import type { Queue } from 'bullmq';
-import { and, eq, lt } from 'drizzle-orm';
+import { and, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
 import { type Database, InjectDb } from '../db/db.module.js';
-import { media } from '../db/schema.js';
+import { media, verifications } from '../db/schema.js';
 import { MediaQueue } from './media-queue.service.js';
-import { JOB, MEDIA_QUEUE, STUCK_AFTER_MS, TREND_RECOMPUTE_EVERY_MS } from './processing.constants.js';
+import {
+  JOB,
+  MEDIA_QUEUE,
+  PREVIEW_JOB,
+  PREVIEW_QUEUE,
+  PRUNE_RENDITIONS_EVERY_MS,
+  STUCK_AFTER_MS,
+  TREND_RECOMPUTE_EVERY_MS,
+} from './processing.constants.js';
 
 /** Housekeeping the worker does when it starts. Registered only in WorkerModule. */
 @Injectable()
@@ -15,8 +23,39 @@ export class ProcessingScheduler {
   constructor(
     @InjectDb() private readonly db: Database,
     @InjectQueue(MEDIA_QUEUE) private readonly queue: Queue,
+    @InjectQueue(PREVIEW_QUEUE) private readonly previewQueue: Queue,
     private readonly mediaQueue: MediaQueue,
   ) {}
+
+  /** Daily clean-up of cached per-newsroom preview renditions (PreviewRenderProcessor.pruneRenditions). */
+  async schedulePruneRenditions(): Promise<void> {
+    await this.previewQueue.upsertJobScheduler(
+      PREVIEW_JOB.pruneRenditions,
+      { every: PRUNE_RENDITIONS_EVERY_MS },
+      { name: PREVIEW_JOB.pruneRenditions, opts: { removeOnComplete: 10, removeOnFail: 50 } },
+    );
+  }
+
+  /**
+   * Backfill: media processed before delivery copies existed (or whose copy failed)
+   * gets a `prepare-delivery` job. Downloads refuse to serve the untouched original,
+   * so until this has run they answer "being prepared".
+   */
+  async queueMissingDeliveries(): Promise<number> {
+    const missing = await this.db
+      .select({ id: media.id })
+      .from(media)
+      .innerJoin(verifications, eq(verifications.mediaId, media.id))
+      .where(
+        and(
+          inArray(media.status, ['IN_REVIEW', 'APPROVED', 'REJECTED']),
+          isNull(sql`${verifications.metadata} -> 'delivery'`),
+        ),
+      );
+    for (const { id } of missing) await this.mediaQueue.enqueueDelivery(id);
+    if (missing.length) this.logger.log(`Queued ${missing.length} delivery copies to prepare`);
+    return missing.length;
+  }
 
   /**
    * Trend scores decay with time even when nothing happens, so they are recomputed

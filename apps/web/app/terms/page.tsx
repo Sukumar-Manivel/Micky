@@ -7,11 +7,11 @@ export const metadata: Metadata = { title: 'Terms' };
 // A static Server Component: prerendered at build time, no client JavaScript.
 export default function TermsPage() {
   return (
-    <LegalPage title="Terms" intro="How FirstFrame works for witnesses who upload footage and for newsrooms that license it.">
+    <LegalPage title="Terms" intro="How Micky works for witnesses who upload footage and for newsrooms that license it.">
       <LegalSection id="uploaders" title="If you upload footage">
         <ul>
           <li>You must have recorded it yourself, and it must be real and not edited to mislead.</li>
-          <li>You keep the copyright. You allow FirstFrame to store the file, check it, and show approved newsrooms a small, watermarked preview.</li>
+          <li>You keep the copyright. You allow Micky to store the file, check it, and show approved newsrooms a small, watermarked preview.</li>
           <li>Every upload is checked by software and reviewed by a person before it goes on sale. We may refuse any upload.</li>
           <li>When a newsroom buys a licence, you earn your share of the price, shown in your Earnings page. Payouts go to your UPI ID.</li>
           <li>You can remove an upload until someone has bought a licence for it.</li>
@@ -56,7 +56,7 @@ export default function TermsPage() {
       <LegalSection id="payments" title="Payments">
         <p>
           Newsrooms pay through Razorpay; card and UPI details are entered on Razorpay’s own page, never on ours. Prices are
-          in Indian rupees and include FirstFrame’s platform fee.
+          in Indian rupees and include Micky’s platform fee.
         </p>
       </LegalSection>
     </LegalPage>

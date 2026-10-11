@@ -86,7 +86,7 @@ export async function openRazorpay(opts: {
       order_id: opts.orderId,
       amount: opts.amount,
       currency: opts.currency,
-      name: 'FirstFrame',
+      name: 'Micky',
       description: opts.description,
       prefill: opts.prefill,
       theme: { color: '#13212c' },

@@ -12,6 +12,7 @@ import { EmptyState, LoadFailed } from '@/components/ui';
 import { marketApi } from '@/lib/api';
 import { formatDateTime, timeAgo } from '@/lib/format';
 import { useApi } from '@/lib/use-api';
+import { approximatePlace } from '@/components/maps';
 import { useLive } from '@/lib/use-live';
 import { useNow } from '@/lib/use-now';
 
@@ -63,7 +64,7 @@ export function IncidentDetailView() {
         <div className="flex flex-col gap-3">
           <CategoryBadge category={data.category} />
           <h1 className="font-display text-5xl font-extrabold">{data.title}</h1>
-          <p className="text-muted">{data.locationName ?? `${data.latitude.toFixed(4)}, ${data.longitude.toFixed(4)}`}</p>
+          <p className="text-muted">{data.locationName ?? approximatePlace(data.latitude, data.longitude)}</p>
           <dl className="grid grid-cols-2 gap-x-6 gap-y-3 border-t border-line pt-4 sm:grid-cols-4">
             <div>
               <dt className="text-sm text-muted">First footage</dt>

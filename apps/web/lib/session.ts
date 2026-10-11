@@ -90,7 +90,7 @@ export type SessionStore = ReturnType<typeof createSessionStore>;
 function withCrossTabLock<T>(fn: () => Promise<T>): Promise<T> {
   if (typeof navigator !== 'undefined' && 'locks' in navigator && navigator.locks) {
     // The lock is held until `fn`'s promise settles, then released for the next tab.
-    return navigator.locks.request('firstframe-refresh', fn) as Promise<T>;
+    return navigator.locks.request('micky-refresh', fn) as Promise<T>;
   }
   return fn();
 }

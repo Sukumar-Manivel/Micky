@@ -33,7 +33,7 @@ function makeClip(file: string, source: string, seconds: number, salt: string) {
       '-c:a', 'aac', '-shortest',
       '-metadata', `creation_time=${new Date().toISOString()}`,
       '-metadata', `location=+${CLIP_LOCATION.lat.toFixed(4)}+0${CLIP_LOCATION.lng.toFixed(4)}/`,
-      '-metadata', `comment=firstframe-e2e-${salt}`,
+      '-metadata', `comment=micky-e2e-${salt}`,
       '-movflags', '+faststart',
       file,
     ],

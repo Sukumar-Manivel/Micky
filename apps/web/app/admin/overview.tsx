@@ -17,7 +17,7 @@ export function AdminOverview() {
       <PageHeader title="Overview">What needs a decision today, and how the marketplace is doing.</PageHeader>
       {error && !data ? <LoadError message={error} onRetry={reload} /> : null}
       {loading ? (
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4" aria-busy="true" aria-label="Loading">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5" aria-busy="true" aria-label="Loading">
           {[0, 1, 2, 3].map((i) => (
             <Skeleton key={i} className="h-32" />
           ))}
@@ -43,13 +43,24 @@ function Waiting({ stats }: { stats: AdminStats }) {
       note: stats.payouts.requested > 0 ? `${formatINR(stats.payouts.requestedAmount)} in total` : 'Nothing waiting',
     },
     { href: '/admin/reports', count: stats.reports.open, label: 'Open reports', note: 'Grievances have legal deadlines' },
+    {
+      href: '/admin/refunds',
+      count: stats.refunds.failed + stats.orders.disputed,
+      label: 'Refunds and disputes',
+      note:
+        stats.refunds.failed > 0
+          ? `${stats.refunds.failed} failed refund(s) to retry`
+          : stats.refunds.pending > 0
+            ? `${stats.refunds.pending} refund(s) in progress`
+            : 'Nothing waiting',
+    },
   ];
   return (
     <section aria-labelledby="waiting-h">
       <h2 id="waiting-h" className="mb-3 text-xl font-bold">
         Waiting for you
       </h2>
-      <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         {tasks.map((t) => (
           <li key={t.href}>
             <Link
@@ -94,6 +105,7 @@ function Numbers({ stats }: { stats: AdminStats }) {
         ['Licences sold', String(stats.orders.paid)],
         ['Revenue', formatINR(stats.orders.revenue)],
         ['Platform fees', formatINR(stats.orders.platformFees)],
+        ['Disputed orders', String(stats.orders.disputed)],
       ],
     },
   ];

@@ -1,4 +1,4 @@
-# FirstFrame API image. ONE image runs three commands:
+# Micky API image. ONE image runs three commands:
 #   API (default):  node dist/main.js
 #   Worker:         node dist/worker.js
 #   Migrations:     node dist/db/migrate.js
@@ -7,7 +7,7 @@
 # Builds for linux/amd64 and linux/arm64 (Oracle Ampere). No native npm modules
 # are used (bcryptjs, pg, ioredis are pure JS), so Alpine/musl is safe.
 #
-#   docker build -t firstframe-api apps/api
+#   docker build -t micky-api apps/api
 
 ARG NODE_VERSION=22
 

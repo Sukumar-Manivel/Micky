@@ -9,6 +9,7 @@ import {
   cleanupStorage,
   CHENNAI,
   createUser,
+  FAKE_DELIVERY_SHA256,
   insertIncident,
   insertMedia,
   insertOrder,
@@ -232,7 +233,7 @@ describe('Marketplace (e2e)', () => {
         availability: { nonExclusive: true, exclusive: true },
       });
       expect(asBuyer.get(sold.id)).toMatchObject({
-        purchased: { orderId: order.id, licenseType: 'NON_EXCLUSIVE' },
+        purchased: { orderId: order.id, licenseType: 'NON_EXCLUSIVE', fileSha256: FAKE_DELIVERY_SHA256 },
         availability: { nonExclusive: false, exclusive: false },
       });
       expect(asBuyer.get(exclusive.id)).toMatchObject({
@@ -247,6 +248,34 @@ describe('Marketplace (e2e)', () => {
         availability: { nonExclusive: true, exclusive: false },
       });
       expect(asOther.get(exclusive.id)).toMatchObject({ purchased: { licenseType: 'EXCLUSIVE' } });
+    });
+  });
+
+  describe('coordinates (review M8)', () => {
+    it('rounds the witness\'s point to about 100 m for channels (list, detail, incident, distance); admins see it exactly', async () => {
+      const uploader = await createUser(app, 'UPLOADER');
+      const exact = { latitude: 11.016844, longitude: 76.955832 };
+      const incident = await insertIncident(app, { latitude: 11.017, longitude: 76.956 });
+      const item = await insertMedia(app, uploader.user.id, { ...exact, incidentId: incident.id });
+      const channel = await approvedChannel(app);
+      const admin = await createUser(app, 'ADMIN');
+
+      const [listed] = (await list(channel.accessToken)).items;
+      expect(listed).toMatchObject({ latitude: 11.017, longitude: 76.956 });
+      const detail = (await api().get(`/api/v1/market/media/${item.id}`).set(auth(channel.accessToken)).expect(200)).body;
+      expect(detail).toMatchObject({ latitude: 11.017, longitude: 76.956 });
+      const inc = (await api().get(`/api/v1/market/incidents/${incident.id}`).set(auth(channel.accessToken)).expect(200)).body;
+      expect(inc.media[0]).toMatchObject({ latitude: 11.017, longitude: 76.956 });
+
+      // Distances are measured from the rounded point too, so radius queries cannot triangulate the exact one.
+      const near = (await list(channel.accessToken, { lat: 11.017, lng: 76.956, radiusKm: 1 })).items[0];
+      expect(near.distanceKm).toBe(0);
+
+      const [forAdmin] = (await list(admin.accessToken)).items;
+      expect(forAdmin).toMatchObject(exact);
+      // The owner sees their own exact point.
+      const own = (await api().get(`/api/v1/me/media/${item.id}`).set(auth(uploader.accessToken)).expect(200)).body;
+      expect(own).toMatchObject(exact);
     });
   });
 

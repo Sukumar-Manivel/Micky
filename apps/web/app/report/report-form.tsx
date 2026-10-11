@@ -13,7 +13,7 @@ const REASONS: { value: ReportReason; help: string }[] = [
   { value: 'COPYRIGHT', help: 'I recorded it, and someone else uploaded it.' },
   { value: 'FAKE', help: 'It is AI-made, edited to mislead, or not from where or when it claims.' },
   { value: 'GRAPHIC', help: 'It shows injured people, a child, or something that should not be shared.' },
-  { value: 'OTHER', help: 'Anything else about FirstFrame.' },
+  { value: 'OTHER', help: 'Anything else about Micky.' },
 ];
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

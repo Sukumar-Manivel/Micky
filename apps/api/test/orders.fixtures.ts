@@ -1,19 +1,24 @@
 // Test fixtures shared by the commerce e2e tests (orders, earnings, admin, reports).
 // Media rows are inserted directly with Drizzle: the upload pipeline is tested elsewhere.
+import { getQueueToken } from '@nestjs/bullmq';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import {
   getStorageToken,
   type ThrottlerStorageService,
 } from '@nestjs/throttler';
-import { eq } from 'drizzle-orm';
+import type { Queue } from 'bullmq';
+import { eq, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 import request from 'supertest';
 import {
   channelProfiles,
   incidents,
+  ledgerEntries,
   media,
+  orders,
   verifications,
 } from '../src/db/schema.js';
+import { COMMERCE_QUEUE } from '../src/orders/refunds.constants.js';
 import { auth, db, registerUser } from './helpers.js';
 
 export type MediaRow = typeof media.$inferSelect;
@@ -133,4 +138,60 @@ export async function buy(
     .set(auth(token))
     .expect(200);
   return paid.body as { id: string; status: string; amount: number };
+}
+
+/** Saves a UPI ID through the API (the current password is required). */
+export function setUpi(
+  app: NestExpressApplication,
+  user: { accessToken: string; password: string },
+  upiId: string,
+) {
+  return request(app.getHttpServer())
+    .put('/api/v1/me/payout-details')
+    .set(auth(user.accessToken))
+    .send({ upiId, currentPassword: user.password });
+}
+
+/**
+ * Ends the hold period of every sale credit of this uploader, as if the hold days had
+ * passed. The ledger is append-only (a trigger refuses UPDATE), so this opens the
+ * documented maintenance window for one transaction, exactly as an operator would.
+ */
+export async function releaseHeldCredits(
+  app: NestExpressApplication,
+  uploaderId: string,
+) {
+  await db(app).transaction(async (tx) => {
+    await tx.execute(sql`set local micky.ledger_maintenance = 'on'`);
+    await tx
+      .update(ledgerEntries)
+      .set({ availableAt: new Date(Date.now() - 1000) })
+      .where(eq(ledgerEntries.uploaderId, uploaderId));
+  });
+}
+
+/** Removes every job of the commerce queue, so a test never sees a job left by another run. */
+export async function drainCommerceQueue(app: NestExpressApplication) {
+  const queue = app.get<Queue>(getQueueToken(COMMERCE_QUEUE));
+  await queue.obliterate({ force: true });
+}
+
+/** Waits (polling the database) until the order reaches `status`; the refund job runs in the background. */
+export async function waitForOrderStatus(
+  app: NestExpressApplication,
+  orderId: string,
+  status: (typeof orders.$inferSelect)['status'],
+) {
+  await expect
+    .poll(
+      async () =>
+        (
+          await db(app)
+            .select({ status: orders.status })
+            .from(orders)
+            .where(eq(orders.id, orderId))
+        )[0]?.status,
+      { timeout: 10_000, interval: 100 },
+    )
+    .toBe(status);
 }

@@ -1,13 +1,32 @@
-# FirstFrame pre-launch security and correctness review
+# Micky pre-launch security and correctness review
 
 - **Date:** 2026-10-11
 - **Scope:** `apps/api`, `apps/web`, `services/verifier`, `infra/`, `scripts/`, `.github/workflows/` at `f40badc`, plus uncommitted work in the tree at the time.
-- **Method:** I read the code end to end. I ran the API, the worker and the verifier locally against a scratch database (`firstframe_review`, Redis db 12) and probed them with curl and ffmpeg. I also ran `tsc`, the unit tests (91 passed), `npm audit --omit=dev` (0 vulnerabilities in api and web) and `pip-audit` (0 in the verifier).
+- **Method:** I read the code end to end. I ran the API, the worker and the verifier locally against a scratch database (`micky_review`, Redis db 12) and probed them with curl and ffmpeg. I also ran `tsc`, the unit tests (91 passed), `npm audit --omit=dev` (0 vulnerabilities in api and web) and `pip-audit` (0 in the verifier).
 - **Labels:**
   - "Verified" means I reproduced it.
   - "Traced" means I followed the code path end to end without running it.
   - "Plausible" means it depends on configuration I could not see.
 - Line numbers were re-read just before writing. Code is changing concurrently, so check them again before fixing.
+
+## Fix status (after the fix wave)
+
+| Finding | Status |
+|---|---|
+| H1 Buyer charged with no refund path | Fixed: `REFUND_PENDING` → `REFUNDED`/`REFUND_FAILED` with an idempotent refund job, admin retry, and checkouts that expire after 30 min |
+| H2 Refunds/chargebacks don't reverse credit | Fixed: credits held for `EARNINGS_HOLD_DAYS`, `SALE_REVERSAL` on refund or dispute, admin adjustments with an audit note |
+| H3 Purchased original reveals the uploader | Fixed: buyers get a metadata-stripped delivery copy, re-checked before sale; the original stays admin-only |
+| H4 Previews saved in full, no viewer named | Fixed: preview capped at min(30 s, 40%); per-newsroom renditions with the viewer burned in; viewer-bound 2-minute tokens; no previews after an exclusive sale |
+| M1 Refresh-token race | Fixed: atomic claim in one transaction, plus a 30-day absolute session lifetime |
+| M2 Open redirect | Fixed: same-origin URL check |
+| M3 Reusable download links | Fixed: single-use, buyer-bound, 2-minute links; only completed downloads are counted |
+| M4 Payout destination change | Fixed: password required, 24 h payout cooling-off, audit table |
+| M5 Licence on an uncaptured payment | Fixed: auto-capture, and captured status, amount and currency verified |
+| M6 Denial of service via media | Fixed: 50 MP / 4K limits, upload quotas, ffmpeg timeouts and pixel caps |
+| M7 Backups unencrypted | Fixed: `age`-encrypted DB backups and backups of sold originals; the limits are documented |
+| M8 Exact coordinates exposed | Fixed: rounded to ~100 m for newsrooms |
+| M9 DPDP / IT Rules | Advisory: needs a lawyer before launch |
+| L1–L10, Info | L1 accepted with throttling (no email yet); L2, L3, L5, L6, L8, L9 and L10 fixed; L4 and L7 open (scale items) |
 
 ## Summary
 
@@ -122,7 +141,7 @@ Phone originals also carry body serial numbers, MakerNotes and sometimes the own
 **Where:**
 - `stream.service.ts:96-101`: the AES key is served to the same bearer token as the segments.
 - `stream.service.ts:67`: the viewer name is only `watermarkText`, which the browser draws on top of the video.
-- `processing/ffmpeg.ts:10,198`: the burned-in mark is the fixed text "FIRSTFRAME PREVIEW", and the preview is the first 30 s.
+- `processing/ffmpeg.ts:10,198`: the burned-in mark is the fixed text "MICKY PREVIEW", and the preview is the first 30 s.
 - `media-processing.service.ts:32`: photo previews are 1280 px.
 - `preview-access.ts:35-37`: previews stay available after an exclusive sale.
 
@@ -130,7 +149,7 @@ Phone originals also carry body serial numbers, MakerNotes and sometimes the own
 1. As channel C1, I called `POST /market/media/:id/preview`.
 2. With no auth header, I ran `ffmpeg -i '<playlistUrl>' -c copy ripped.mp4`.
 3. The result is a clean 12 s, 640×360 MP4: the whole clip.
-4. Its only mark is the generic tiled "FIRSTFRAME PREVIEW". The newsroom name is not in it, and GPS tags were correctly stripped.
+4. Its only mark is the generic tiled "MICKY PREVIEW". The newsroom name is not in it, and GPS tags were correctly stripped.
 
 **What follows:**
 - Most eyewitness clips are under 30 s, so a non-paying channel gets the *entire* story at broadcast-usable 480p.
@@ -173,7 +192,7 @@ A thief who replays a stolen cookie at the same time as the real client keeps a 
 
 **What's wrong:** `safeNext` accepts any path that starts with `/` but not `//`. The URL parser turns `/\evil.example` and `/<TAB>/evil.example` into `https://evil.example/`; I confirmed this with Node's WHATWG `URL`. Next's `router.replace` treats a different origin as external and calls `location.replace` (`next/dist/client/components/app-router.js` `mpaNavigation`).
 
-**Exploit:** Send `https://firstframe.in/login?next=/%5Cevil.example/login` to a newsroom. After a real login, the user lands on a look-alike page saying "session expired, sign in again".
+**Exploit:** Send `https://micky.in/login?next=/%5Cevil.example/login` to a newsroom. After a real login, the user lands on a look-alike page saying "session expired, sign in again".
 
 **Fix:** Resolve the URL with `new URL(next, location.origin)`, require `url.origin === location.origin`, then redirect to `url.pathname + url.search`. Or allow-list known path prefixes.
 

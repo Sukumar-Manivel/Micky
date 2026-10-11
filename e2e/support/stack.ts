@@ -1,4 +1,4 @@
-// Boots the whole FirstFrame stack for the browser tests, and stops it again:
+// Boots the whole Micky stack for the browser tests, and stops it again:
 //   PostgreSQL (fresh database, migrated and seeded) and Redis (flushed db) must be running;
 //   verifier (Python), API, worker and web (Node) are started here as child processes.
 //
@@ -54,6 +54,8 @@ export function apiEnv(): NodeJS.ProcessEnv {
     VERIFIER_URL,
     PAYMENTS_PROVIDER: 'mock',
     PLATFORM_FEE_PERCENT: '30',
+    // Sale credits are normally held 7 days before payout (refund window); the money path pays out at once.
+    EARNINGS_HOLD_DAYS: '0',
     ADMIN_EMAIL,
     ADMIN_PASSWORD,
     ADMIN_NAME: 'E2E Admin',

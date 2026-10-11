@@ -13,7 +13,7 @@ export function Logo() {
   return (
     <span className="flex items-center gap-2">
       <LogoMark />
-      <span className="font-display text-2xl font-extrabold">FirstFrame</span>
+      <span className="font-display text-2xl font-extrabold">Micky</span>
     </span>
   );
 }

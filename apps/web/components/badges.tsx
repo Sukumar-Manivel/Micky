@@ -54,8 +54,27 @@ export function CategoryBadge({ category }: { category: Category }) {
   return <Badge tone="signal">{CATEGORY_LABEL[category]}</Badge>;
 }
 
-const orderTone: Record<OrderStatus, Tone> = { CREATED: 'warn', PAID: 'good', FAILED: 'bad' };
-const orderLabel: Record<OrderStatus, string> = { CREATED: 'Awaiting payment', PAID: 'Paid', FAILED: 'Failed' };
+const orderTone: Record<OrderStatus, Tone> = {
+  CREATED: 'warn',
+  PAID: 'good',
+  FAILED: 'bad',
+  EXPIRED: 'neutral',
+  REFUND_PENDING: 'progress',
+  REFUNDED: 'neutral',
+  REFUND_FAILED: 'bad',
+  DISPUTED: 'bad',
+};
+const orderLabel: Record<OrderStatus, string> = {
+  CREATED: 'Awaiting payment',
+  PAID: 'Paid',
+  FAILED: 'Payment failed',
+  EXPIRED: 'Expired',
+  REFUND_PENDING: 'Refund in progress',
+  REFUNDED: 'Refunded',
+  // The buyer is told the truth: support is retrying it, it is not "on its way" by itself.
+  REFUND_FAILED: 'Refund delayed',
+  DISPUTED: 'Disputed',
+};
 export function OrderStatusBadge({ status }: { status: OrderStatus }) {
   return <Badge tone={orderTone[status]}>{orderLabel[status]}</Badge>;
 }

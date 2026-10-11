@@ -1,6 +1,6 @@
-# Testing FirstFrame
+# Testing Micky
 
-How FirstFrame is tested, how to run each suite, what the tests found, and how to talk about it in an interview.
+How Micky is tested, how to run each suite, what the tests found, and how to talk about it in an interview.
 
 ## The test pyramid
 
@@ -32,8 +32,8 @@ PostgreSQL and Redis must be running locally (`service postgresql start`, `redis
 # API: lint, typecheck, unit, e2e
 cd apps/api
 npm run lint && npm run typecheck && npm test
-createdb -O firstframe firstframe_test_<you>     # once
-TEST_DATABASE_URL=postgresql://firstframe:firstframe@localhost:5432/firstframe_test_<you> \
+createdb -O micky micky_test_<you>     # once
+TEST_DATABASE_URL=postgresql://micky:micky@localhost:5432/micky_test_<you> \
 TEST_REDIS_URL=redis://localhost:6379/<n> npm run test:e2e
 
 # Web: lint, typecheck, unit, build
@@ -140,7 +140,7 @@ CI (`.github/workflows/ci.yml`) runs the same steps in the jobs `api`, `web`, `v
 
 ### Noticed but not changed
 
-- **Seed and login disagree about valid emails.** The seed accepts an admin email that the login DTO's `IsEmail` rejects. An address with a digit in the TLD, such as `admin@firstframe.e2e`, can be seeded but can never log in. The e2e suite uses `.test`.
+- **Seed and login disagree about valid emails.** The seed accepts an admin email that the login DTO's `IsEmail` rejects. An address with a digit in the TLD, such as `admin@micky.e2e`, can be seeded but can never log in. The e2e suite uses `.test`.
 - **Unpaid checkouts never expire.** A `CREATED` order keeps its original amount and can be paid later, even after the uploader has raised the price. The 30-minute window only applies to *reusing* a checkout. Fixing it needs a product decision: either expire checkouts, or refuse and refund payments below the current price.
 - **Local dev setup.** `apps/api/.env` leaves `INTERNAL_TOKEN` empty. The API then uses `dev-insecure-internal_token-change-me`, while an empty token on the verifier rejects every call. A local stack started from the READMEs therefore never gets AI or C2PA results unless both sides set the same token. The e2e stack sets it explicitly.
 - Security findings are in `docs/REVIEW.md` and are handled by a separate fix wave.
@@ -165,7 +165,7 @@ CI (`.github/workflows/ci.yml`) runs the same steps in the jobs `api`, `web`, `v
 
 **Why separate test databases?**
 - Tests must start from a known state and must not interfere with each other.
-- Each developer or CI job gets its own database (`firstframe_test_<name>`) and Redis db index.
+- Each developer or CI job gets its own database (`micky_test_<name>`) and Redis db index.
 - The API e2e suite truncates between tests. The browser suite drops and recreates its database and applies the real migrations, which also tests the migrations.
 - Using the real Postgres, not SQLite or a mock, matters here. The correctness relies on Postgres features: `SELECT … FOR UPDATE`, advisory locks, partial unique indexes and `ON CONFLICT`.
 

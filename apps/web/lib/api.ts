@@ -6,7 +6,9 @@
 import { apiBase } from './config';
 import { createSessionStore } from './session';
 import type {
+  AdminOrder,
   AdminPayout,
+  AdminRefund,
   AdminStats,
   AuthResponse,
   Category,
@@ -24,12 +26,14 @@ import type {
   OrderStatus,
   OrderView,
   Paginated,
+  PayoutDetailsView,
   PayoutStatus,
   PayoutView,
   PreviewSession,
   Report,
   ReportReason,
   ReportStatus,
+  RefundStatus,
   ReviewItem,
   RiskLevel,
   SaleView,
@@ -63,7 +67,7 @@ export function errorMessageFromBody(body: unknown, status: number): string {
 export function describeError(err: unknown): string {
   if (err instanceof ApiError) return err.message;
   // fetch() rejects with a TypeError when the network is down or CORS blocks the request.
-  if (err instanceof TypeError) return 'Could not reach FirstFrame. Check your internet connection.';
+  if (err instanceof TypeError) return 'Could not reach Micky. Check your internet connection.';
   // Errors we throw ourselves (e.g. Razorpay failures) carry a message written for people.
   if (err instanceof Error && err.message) return err.message;
   return 'Something went wrong. Please try again.';
@@ -168,8 +172,11 @@ export const myMediaApi = {
 
 // ---------- Uploader: earnings ----------
 export const earningsApi = {
-  setPayoutDetails: (upiId: string) =>
-    request<{ user: UserView }>('PUT', '/me/payout-details', { body: { upiId } }),
+  /** Changing where money goes needs the account password (and pauses payouts for 24 h). */
+  setPayoutDetails: (upiId: string, currentPassword: string) =>
+    request<{ user: UserView; payoutDetails: PayoutDetailsView }>('PUT', '/me/payout-details', {
+      body: { upiId, currentPassword },
+    }),
   summary: () => get<EarningsSummary>('/me/earnings'),
   ledger: (q: PageQuery = {}) => get<Paginated<LedgerEntryView>>('/me/ledger', q),
   sales: (q: PageQuery = {}) => get<Paginated<SaleView>>('/me/sales', q),
@@ -230,6 +237,11 @@ export const adminApi = {
   payouts: (q: PageQuery & { status?: PayoutStatus } = {}) => get<Paginated<AdminPayout>>('/admin/payouts', q),
   markPaid: (id: string, reference: string) => post<PayoutView>(`/admin/payouts/${id}/mark-paid`, { reference }),
   rejectPayout: (id: string, note: string) => post<PayoutView>(`/admin/payouts/${id}/reject`, { note }),
+  refunds: (q: PageQuery & { status?: RefundStatus } = {}) => get<Paginated<AdminRefund>>('/admin/refunds', q),
+  retryRefund: (id: string) => post<{ id: string; status: 'PENDING' }>(`/admin/refunds/${id}/retry`),
+  orders: (q: PageQuery & { status?: OrderStatus } = {}) => get<Paginated<AdminOrder>>('/admin/orders', q),
+  createAdjustment: (body: { uploaderEmail: string; amount: number; note: string }) =>
+    post<LedgerEntryView & { uploaderId: string }>('/admin/ledger-adjustments', body),
   reports: (q: PageQuery & { status?: ReportStatus } = {}) => get<Paginated<Report>>('/admin/reports', q),
   resolveReport: (id: string, resolution: string, removeMedia: boolean) =>
     post<Report>(`/admin/reports/${id}/resolve`, { resolution, removeMedia }),

@@ -1,6 +1,5 @@
 import { priceFor, splitSale } from '../common/money.js';
 import { type LicenceState, licenceBlocker } from './licence-rules.js';
-import { downloadFileName } from './order-view.js';
 
 const fresh: LicenceState = {
   mediaStatus: 'APPROVED',
@@ -87,20 +86,5 @@ describe('splitSale (money rounding)', () => {
     const item = { priceNonExclusive: 500_00, priceExclusive: 2_000_00 };
     expect(priceFor(item, 'NON_EXCLUSIVE')).toBe(500_00);
     expect(priceFor(item, 'EXCLUSIVE')).toBe(2_000_00);
-  });
-});
-
-describe('downloadFileName', () => {
-  it('builds a safe name from the title and the original extension', () => {
-    expect(downloadFileName('Fire near Gandhipuram!', 'IMG_0042.MOV')).toBe(
-      'fire-near-gandhipuram.mov',
-    );
-    expect(downloadFileName('Flood / Road  closed', 'a.b.jpeg')).toBe(
-      'flood-road-closed.jpeg',
-    );
-  });
-
-  it('falls back to a default name and handles missing extensions', () => {
-    expect(downloadFileName('!!!', 'video')).toBe('firstframe-media');
   });
 });

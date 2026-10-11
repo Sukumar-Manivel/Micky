@@ -1,13 +1,14 @@
-// The money path, end to end, the way real people use FirstFrame:
+// The money path, end to end, the way real people use Micky:
 //
 //   witness uploads a clip → worker processes it → admin reviews the evidence and approves it
 //   → a newsroom (approved by the admin) gets a live alert, finds it in the feed and on the
-//   incident page, watches the protected preview, buys a licence, downloads the original
+//   incident page, watches the protected preview, buys a licence, downloads the file (metadata removed)
 //   → the witness sees the earning, adds a UPI ID and withdraws → the admin marks it paid.
 //
 // Three browser contexts (= three people with their own cookies) stay open for the whole
 // story, so each person logs in once. The steps depend on each other: describe.serial stops
 // at the first failure instead of producing a cascade of confusing errors.
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { type BrowserContext, type Page, expect, test } from '@playwright/test';
 import { PASSWORD, uniqueEmail } from '../support/api.js';
@@ -152,7 +153,12 @@ test.describe.serial('money path: upload → review → licence → download →
     // Leave the page first, so only the fresh page's requests are matched below.
     const mediaUrl = channel.url();
     await channel.goto('about:blank');
-    const session = channel.waitForResponse((r) => r.url().endsWith(`/market/media/${mediaId}/preview`));
+    // The first view may answer 202 "preparing" while the worker burns this newsroom's name
+    // into its own copy of the preview; the player then asks again until it gets the session.
+    const session = channel.waitForResponse(
+      (r) => r.url().endsWith(`/market/media/${mediaId}/preview`) && r.status() === 200,
+      { timeout: 60_000 },
+    );
     const playlist = channel.waitForResponse((r) => /\/stream\/[^/]+\/index\.m3u8$/.test(r.url()));
     const key = channel.waitForResponse((r) => /\/stream\/[^/]+\/key\.bin$/.test(r.url()));
     const segment = channel.waitForResponse((r) => /\/stream\/[^/]+\/seg_\d+\.ts$/.test(r.url()));
@@ -166,8 +172,12 @@ test.describe.serial('money path: upload → review → licence → download →
     expect(m3u8.headers()['content-type']).toContain('mpegurl');
     const text = await m3u8.text();
     expect(text).toContain('#EXTM3U');
-    expect(text).toContain('#EXT-X-KEY:METHOD=AES-128,URI="key.bin"');
+    // The key and the segments each get their own short-lived token, bound to this viewer.
+    expect(text).toMatch(/#EXT-X-KEY:METHOD=AES-128,URI="\.\.\/[\w-]+\.[\w-]+\/key\.bin"/);
     expect((await key).status()).toBe(200);
+    // At most 40% of the 6 s clip reaches the browser before payment.
+    const previewSeconds = [...text.matchAll(/#EXTINF:([\d.]+)/g)].reduce((sum, m) => sum + Number(m[1]), 0);
+    expect(previewSeconds).toBeLessThanOrEqual(2.5);
 
     // The protected player: no download button, and the viewer's organisation over the picture.
     const video = channel.getByLabel(`Preview of ${title}`);
@@ -215,10 +225,24 @@ test.describe.serial('money path: upload → review → licence → download →
     expect(file.suggestedFilename()).toMatch(/^Warehouse-fire-near-Central-station-[a-z0-9]+\.mp4$/);
     const saved = await file.path();
     const bytes = sha256(saved);
-    const [{ checksum }] = await queryDb<{ checksum: string }>('SELECT checksum FROM media WHERE id = $1', [mediaId]);
-    expect(bytes, 'downloaded bytes = the upload, as checksummed by the API').toBe(checksum);
-    expect(bytes).toBe(sha256(CLIPS.main));
-    expect(readFileSync(saved).length).toBe(readFileSync(CLIPS.main).length);
+    // The buyer gets the delivery copy: same pictures and sound, but without the witness's
+    // GPS and device tags (review H3). Its checksum is what the API publishes for it.
+    const [{ checksum, delivery }] = await queryDb<{ checksum: string; delivery: string }>(
+      `SELECT m.checksum, v.metadata->'delivery'->>'sha256' AS delivery
+         FROM media m JOIN verifications v ON v.media_id = m.id WHERE m.id = $1`,
+      [mediaId],
+    );
+    expect(bytes, 'downloaded bytes = the delivery copy, as checksummed by the worker').toBe(delivery);
+    expect(bytes, 'not the untouched upload').not.toBe(checksum);
+    expect(checksum).toBe(sha256(CLIPS.main));
+    await expect(channel.getByTestId('file-sha256')).toHaveText(delivery);
+    const tags = JSON.parse(
+      execFileSync('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', saved]).toString(),
+    ) as { format: { tags?: Record<string, string>; duration: string }; streams: { codec_type: string }[] };
+    expect(Object.keys(tags.format.tags ?? {})).not.toContain('location');
+    expect(Object.keys(tags.format.tags ?? {})).not.toContain('comment');
+    expect(tags.streams.map((st) => st.codec_type).sort()).toEqual(['audio', 'video']);
+    expect(Number(tags.format.duration)).toBeGreaterThan(5.5); // the whole clip, not the preview
 
     // It is listed under Purchases too.
     await channel.goto('/newsroom/purchases');
@@ -237,6 +261,7 @@ test.describe.serial('money path: upload → review → licence → download →
     await expect(uploader.getByRole('table').filter({ hasText: organization })).toContainText('₹1,050');
 
     await uploader.getByLabel('UPI ID').fill(upiId);
+    await uploader.getByLabel('Your account password').fill(PASSWORD);
     await uploader.getByRole('button', { name: 'Save UPI ID' }).click();
     await expect(uploader.getByText('UPI ID saved')).toBeVisible();
 
@@ -262,8 +287,9 @@ test.describe.serial('money path: upload → review → licence → download →
     await expect(payouts.getByRole('row').filter({ hasText: upiId })).toContainText('412345678901');
     const paidOut = uploader.locator('dl > div').filter({ hasText: 'Paid out' });
     await expect(paidOut).toContainText('₹1,050');
-    const balance = uploader.locator('dl > div').filter({ hasText: 'Balance' });
-    await expect(balance).toContainText('₹0');
+    // "Available" (was "Balance") since sale credits can be on hold before payout.
+    const available = uploader.locator('dl > div').filter({ hasText: 'Available' });
+    await expect(available).toContainText('₹0');
   });
 
   test('no page crashed along the way', () => {

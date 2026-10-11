@@ -34,7 +34,7 @@ export const VERIFIER_URL = env.E2E_VERIFIER_URL ?? `http://localhost:${VERIFIER
 
 /** A fresh database is created (dropped first) for every run, unless E2E_EXTERNAL_STACK=1. */
 export const DATABASE_URL =
-  env.E2E_DATABASE_URL ?? 'postgresql://firstframe:firstframe@localhost:5432/firstframe_e2e';
+  env.E2E_DATABASE_URL ?? 'postgresql://micky:micky@localhost:5432/micky_e2e';
 /** Redis db index 13 by default, flushed at the start of a run. */
 export const REDIS_URL = env.E2E_REDIS_URL ?? 'redis://localhost:6379/13';
 
@@ -42,7 +42,7 @@ export const REDIS_URL = env.E2E_REDIS_URL ?? 'redis://localhost:6379/13';
 export const INTERNAL_TOKEN = env.E2E_INTERNAL_TOKEN ?? 'e2e-internal-token-0123456789abcdef';
 
 /** The seeded admin (admins cannot self-register). */
-export const ADMIN_EMAIL = env.E2E_ADMIN_EMAIL ?? 'admin@firstframe-e2e.test';
+export const ADMIN_EMAIL = env.E2E_ADMIN_EMAIL ?? 'admin@micky-e2e.test';
 export const ADMIN_PASSWORD = env.E2E_ADMIN_PASSWORD ?? 'e2e-admin-password-123';
 
 /** Set to 1 to test a stack you started yourself (nothing is booted, migrated or seeded). */

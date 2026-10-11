@@ -1,6 +1,6 @@
 # Deployment, explained
 
-How FirstFrame goes from code on a laptop to a live HTTPS site on one free Oracle VM, and why each piece is there. The step-by-step guide is `docs/DEPLOYMENT.md`. This file is for understanding it well enough to explain it in an interview.
+How Micky goes from code on a laptop to a live HTTPS site on one free Oracle VM, and why each piece is there. The step-by-step guide is `docs/DEPLOYMENT.md`. This file is for understanding it well enough to explain it in an interview.
 
 ## What was built and why
 
@@ -29,8 +29,10 @@ git push main
        ├─ ci.yml (reused): api lint/typecheck/unit/e2e · web lint/typecheck/test/build · verifier ruff/pytest · compose/shellcheck · docker builds
        ├─ build ×6: {api, web, verifier} × {amd64 runner, arm64 runner} → push by digest to ghcr.io
        ├─ manifest ×3: join the two digests into one multi-arch tag: :<sha> and :latest
-       └─ deploy: scp compose + Caddyfile + scripts → ssh "scripts/deploy.sh <sha>"
-                    └─ on the VM: set IMAGE_TAG=<sha> in .env → compose pull → run migrate
+       └─ deploy: ssh vm ff-upload  (tar of compose + Caddyfile on stdin)
+                  ssh vm "ff-deploy <sha> <user>"  (registry token on stdin)
+                    └─ the VM's forced command (deploy-gate) checks each request, then:
+                       set IMAGE_TAG=<sha> in .env → compose pull → run migrate
                                   → compose up -d (only changed containers restart)
                                   → reload Caddy → wait until api is "healthy" → prune old images
 ```
@@ -38,7 +40,7 @@ git push main
 And a request once it's live:
 
 ```
-Phone ─HTTPS─▶ api.firstframe.in (DNS → VM IP) ─▶ Caddy :443 (TLS ends here)
+Phone ─HTTPS─▶ api.micky.in (DNS → VM IP) ─▶ Caddy :443 (TLS ends here)
              ─HTTP─▶ api:4000 (Docker network "edge") ─▶ NestJS ─▶ postgres:5432 / redis:6379 (network "backend", internal)
 ```
 
@@ -46,7 +48,7 @@ Phone ─HTTPS─▶ api.firstframe.in (DNS → VM IP) ─▶ Caddy :443 (TLS en
 
 ### Image vs container
 
-- An **image** is a read-only, layered snapshot of a filesystem plus metadata: the default command, environment variables, the user to run as and the exposed port. `firstframe-api:3f2c1ab` is an image. Think of it as a class.
+- An **image** is a read-only, layered snapshot of a filesystem plus metadata: the default command, environment variables, the user to run as and the exposed port. `micky-api:3f2c1ab` is an image. Think of it as a class.
 - A **container** is a running (or stopped) instance of an image. It gets its own thin writable layer, process namespace and network interface. `api` and `worker` are two containers from the **same** image with different commands. Think of them as two objects of the same class.
 - Containers are disposable: anything written inside one disappears when it's recreated. Data that must survive lives in **volumes** (`pgdata`, `mediadata`, `caddy_data`).
 
@@ -116,7 +118,7 @@ Why **Cloudflare DNS-only for the API**? The free Cloudflare proxy caps request 
 
   | Where | What | Notes |
   |---|---|---|
-  | `/opt/firstframe/.env` on the VM | app secrets | `chmod 600`, never in Git |
+  | `/opt/micky/.env` on the VM | app secrets | `chmod 600`, never in Git |
   | GitHub environment secrets | SSH key, host | only the `deploy` job, in the `production` environment, can read them |
   | `GITHUB_TOKEN` | registry push/pull | created per run, expires when the job ends |
 
@@ -124,11 +126,24 @@ Why **Cloudflare DNS-only for the API**? The free Cloudflare proxy caps request 
   - Workflows default to `permissions: {}` or `contents: read`.
   - Only the build jobs get `packages: write`.
   - `persist-credentials: false` stops checkout from leaving a token in `.git/config`.
+- **Supply chain (review finding L9):**
+  - Every third-party action is pinned to a **full commit SHA**, with the version in a comment (`actions/checkout@fbc6f39… # v5.1.0`). A tag like `v5` can be moved by whoever controls that repository, so the code that runs with our `packages: write` token could change under us. A SHA cannot.
+  - Pinning only helps if you keep updating, so `.github/dependabot.yml` proposes weekly PRs for actions, npm, pip and base images. Each PR runs the full CI.
+  - `SSH_KNOWN_HOSTS` is **required**. The old fallback (`ssh-keyscan` at deploy time) trusted whatever answered, which is exactly what a man-in-the-middle wants.
+  - The deploy key is pinned to a **forced command** on the server (`command="/usr/local/sbin/micky-deploy-gate",restrict` in `authorized_keys`). The deploy user is in the `docker` group, which is root-equivalent, so the key used to be a root key. Now it can do two things:
+    - upload a compose file and Caddyfile, which are rejected if they use other images, `privileged`, host namespaces, extra capabilities or bind mounts;
+    - deploy a tag.
+    The gate is root-owned and outside `/opt/micky`, so the key can't rewrite it. Residual risk: someone with both the key and push access to our registry can still run their image.
 - **Build-time vs run-time config:** Next.js inlines `NEXT_PUBLIC_*` variables into browser JavaScript at **build** time, so an image built that way only works for one API address (and a secret put there is public). The web app avoids that: the container's `PUBLIC_API_URL` is served to the browser at runtime by `/runtime-config.js`, so **one image** runs on staging, production or a laptop. `NEXT_PUBLIC_API_URL` stays only as a build-time fallback. The rule "build once, configure per environment" is what makes promoting the exact tested image possible.
-- **Hardening ideas:**
-  - Move `BACKUP_S3_*` keys to a separate file that only the backup script reads; the app containers don't need them.
-  - Use Docker secrets or SOPS-encrypted files.
-  - Rotate the R2 token and deploy key yearly.
+- **Each container gets only its own secrets** (review finding L3). There is no `env_file: .env`: `docker-compose.yml` lists, per service, exactly the variables it needs.
+  - `api`: the JWT and signing secrets and the Razorpay keys.
+  - `worker`: only `INTERNAL_TOKEN` (to call the verifier).
+  - `migrate`: only `DATABASE_URL`.
+  - The backup keys (`BACKUP_*`), `ADMIN_PASSWORD` and `POSTGRES_PASSWORD` never enter an app container; the backup scripts on the host read them.
+
+  `AppConfig` knows which process it is (`APP_ROLE=api|worker`) and requires only that process's secrets in production. A secret the process doesn't need becomes a random value, never a guessable default, so an accidental use fails closed.
+- **Network isolation follows the same idea.** The worker parses untrusted video with ffmpeg, the riskiest code we run. It sits only on the internal `backend` network: no internet, no route to Caddy. If an ffmpeg exploit ever lands, there is nowhere to send data. (With `STORAGE_DRIVER=s3` it needs R2, so it would also join `edge`.)
+- **Hardening ideas still open:** Docker secrets or SOPS-encrypted files instead of a plain `.env`; yearly rotation of the R2 token and the deploy key.
 
 ### CI vs CD
 
@@ -150,61 +165,45 @@ Renaming a column in one step would break the old API for the seconds the deploy
 
 ### Backups
 
-- **What:** the database (a logical `pg_dump` in plain SQL, gzipped). Postgres holds the money ledger, users and orders, so this matters most.
+- **What:**
+  - The database: a logical `pg_dump`, gzipped, then **encrypted**. Postgres holds the money ledger, users, password hashes, UPI IDs and GPS metadata, so this matters most.
+  - **Sold originals**: footage a newsroom has paid for, which we owe someone.
+- **Encryption with a public key (review finding M7).** Backups are encrypted on the server with [age](https://age-encryption.org) to a **public** key (`BACKUP_AGE_RECIPIENTS`). The private key lives off the server: a password manager plus a second copy. So:
+  - a leaked R2 token reveals nothing;
+  - a compromised VM can write new backups but cannot read old ones;
+  - the plaintext only ever exists inside a pipe (`pg_dump | gzip | age > file`).
+  The cost: the server can't test-decrypt its own backup, which is why restores must be practised. `make test-backups` runs the whole round trip locally and in CI.
 - **Where:**
-  - On the VM (fast restores).
+  - On the VM, for fast restores.
   - **Off the VM** in Cloudflare R2, so losing the VM, disk or account doesn't lose the data.
-  - The R2 token can only touch the backup bucket.
-- **How long:** 14 days, pruned by the script (`rclone delete --min-age 14d`), with an R2 lifecycle rule as a safety net.
+  - The R2 token can only touch the backup bucket. An **R2 bucket lock** stops anyone, a compromised server included, deleting dumps early. A lifecycle rule expires them after 30 days, so the script no longer needs to delete anything remotely.
+- **Media, within the free tier.** R2 is free up to 10 GB, while the VM can hold about 150 GB of media, so not everything fits.
+  - `backup-media.sh` uploads every **sold** original (age-encrypted, streamed with `age | rclone rcat`, no temp file).
+  - It uses an upload-then-rename, so a failed read never leaves a truncated object that looks backed up.
+  - It refuses to go over `BACKUP_MEDIA_MAX_GB` (default 8 GB).
+  - Previews are rebuildable from originals, so they're skipped.
+  - Unsold originals are covered only by Oracle's monthly boot-volume backup. That is the honest gap.
 - **Safety:**
   - `flock` prevents overlapping runs.
-  - `gzip -t` and a size check catch empty or broken dumps.
-  - `umask 077` keeps dumps private.
-  - The restore takes a safety dump first and loads in a single transaction.
+  - A size check and an age-header check catch empty or broken dumps.
+  - The restore decrypts and gzip-tests **before** touching the live database, takes a safety dump first, and loads in a single transaction.
+  - age authenticates the data, so a tampered or truncated file fails at decryption.
+  - The scripts fail loudly when the database query or the bucket listing fails. A silent "0 files to back up" is the worst kind of backup bug.
 - **The 3-2-1 rule:** 3 copies, 2 kinds of media, 1 off-site. We have the live DB, a local dump and an R2 copy.
-- **The gap, stated honestly:** media files are not in the nightly backup (too large for R2's free 10 GB). Use Oracle's free volume backups monthly, or move media to R2 (`STORAGE_DRIVER=s3`) once there's budget.
 - **RPO/RTO:**
   - RPO (how much data you can lose): up to 24 hours.
-  - RTO (how long recovery takes): about 15 minutes on a ready VM.
+  - RTO (how long recovery takes): about 15 minutes on a ready VM, plus fetching the private key.
   - Continuous WAL archiving (e.g. pgBackRest or WAL-G to R2) would bring the RPO down to minutes.
-
-### Zero-downtime considerations
-
-With one VM and one API container there is a short gap while the new container starts. What we do about it:
-- Only containers whose image changed are recreated.
-- Socket.IO clients reconnect by themselves.
-- Uploads in progress during a restart fail and must be retried, which is why deploys are not run during peak hours.
-
-What true zero downtime needs:
-- **Two API replicas** behind the proxy, with health-checked rolling replacement (start new → wait healthy → stop old). Caddy's `reverse_proxy` can load-balance and health-check several upstreams. Tools like Docker Swarm, Kubernetes, Kamal or `docker-rollout` automate it.
-- **Graceful shutdown:** stop accepting new requests, finish in-flight ones (`enableShutdownHooks`, `stop_grace_period`). BullMQ returns an unfinished job to the queue if a worker dies.
-- **Backward-compatible migrations** (above), and sticky sessions or a Redis adapter for WebSockets once there are several API instances.
-
-### How this would scale beyond one VM
-
-In order, as load grows:
-
-1. **Vertical first:** a bigger VM. Cheapest and simplest.
-2. **Move state out of the box:**
-   - Media to object storage (`STORAGE_DRIVER=s3`).
-   - Postgres to a managed service with automated backups and point-in-time recovery.
-   - Redis to a managed instance.
-   Now the app servers are **stateless**.
-3. **Horizontal app tier:**
-   - Several API containers behind a load balancer.
-   - The **Socket.IO Redis adapter**, so a live alert emitted on one API instance reaches clients connected to another.
-   - Rate limits stored in Redis instead of memory.
-4. **Separate the worker pool:** ffmpeg is CPU-heavy, so run workers on their own (possibly autoscaled or spot) machines. They pull jobs from the shared Redis queue; more workers means more throughput, with no code change.
-5. **Verifier on a GPU or a separate service** with its own autoscaling.
-6. **CDN for previews:** a paid video product (e.g. Cloudflare Stream) or signed URLs straight from object storage, so video bytes stop flowing through the API.
-7. **Orchestration:** Kubernetes or a managed container platform for rolling deploys, autoscaling and self-healing. Add observability (metrics, traces, central logs) before you need it.
 
 ## Trade-offs we made
 
 | Choice | Benefit | Cost |
 |---|---|---|
 | One VM, Docker Compose | Free, simple, easy to reason about | Single point of failure; brief downtime on deploy |
-| Media on local disk | 200 GB free vs 10 GB in R2 | Not in the nightly backup; the VM holds state |
+| Media on local disk | 200 GB free vs 10 GB in R2 | Only sold originals go off-site (size cap); the VM holds state |
+| age public-key backups | Server and R2 leaks can't read backups | Lose the private key and every backup is useless; keep two copies |
+| Forced-command deploy key | A stolen key can't get a shell | Script changes need a manual copy with your own key |
+| Actions pinned to SHAs | Upstream tag moves can't change our CI | Needs Dependabot PRs to stay current |
 | Caddy instead of Nginx + certbot | Automatic HTTPS in a 60-line file | Fewer tutorials for advanced cases |
 | API not behind Cloudflare | 500 MB uploads, no video-terms risk | No CDN/DDoS shield for the API |
 | Alpine base images | Small images | musl libc: fine here (no native npm modules), but can bite with native addons |
@@ -215,7 +214,7 @@ In order, as load grows:
 ## Interview questions with model answers
 
 **1. What's the difference between a Docker image and a container?**
-An image is an immutable, layered template: a filesystem plus metadata like the default command and user. A container is a running instance of an image with its own writable layer, process space and network. In FirstFrame the `api` and `worker` containers come from the same image with different commands. Containers are disposable, so persistent data goes in volumes.
+An image is an immutable, layered template: a filesystem plus metadata like the default command and user. A container is a running instance of an image with its own writable layer, process space and network. In Micky the `api` and `worker` containers come from the same image with different commands. Containers are disposable, so persistent data goes in volumes.
 
 **2. Why use multi-stage builds?**
 To separate the build environment from the runtime. Compilers, dev dependencies and source stay in earlier stages; the final stage copies only build output and production dependencies. Images get smaller (faster pulls on a small VM), have fewer vulnerable packages, and leak no source or build secrets.
@@ -245,7 +244,7 @@ Run them as a separate one-shot step before starting the new code, and make them
 Images are tagged with the commit SHA and old tags stay in the registry, so a rollback is `deploy.sh <previous-sha>` (or re-running the workflow with that tag). It pulls the old images and recreates the containers. Because migrations are backward compatible, the old code still works with the newer schema. If data was corrupted, restore the database from the last backup.
 
 **11. Describe your backup strategy. What are RPO and RTO?**
-A nightly `pg_dump`, gzipped, checked for integrity, kept locally and copied off-site to Cloudflare R2 with 14-day retention. The R2 token is scoped to that bucket only. Restores are scripted and practised. RPO (recovery point objective) is how much data you can lose: up to 24 hours here. RTO (recovery time objective) is how long recovery takes: about 15 minutes. Continuous WAL archiving would cut the RPO to minutes.
+A nightly `pg_dump`, gzipped and encrypted with age to a public key whose private half is kept off the server. It's kept locally and copied off-site to Cloudflare R2, protected by a bucket lock and expired by a lifecycle rule. Sold originals go to R2 the same way, under a size cap that keeps us in the free tier. Restores are scripted and tested in CI. RPO (recovery point objective) is how much data you can lose: up to 24 hours here. RTO (recovery time objective) is how long recovery takes: about 15 minutes. Continuous WAL archiving would cut the RPO to minutes.
 
 **12. How do you build images for an Arm server from x86 CI?**
 Either emulate Arm with QEMU via `docker buildx --platform linux/arm64` (simple but slow), or build natively on Arm runners. We build each architecture on its own native runner, push by digest, then combine them into one multi-arch manifest list so `docker pull` picks the right one on any machine.
@@ -261,3 +260,12 @@ Run at least two replicas behind a health-checking load balancer. Replace them o
 
 **16. What is a Docker healthcheck, and how did you use it?**
 A command Docker runs periodically inside the container. Its exit code marks the container `healthy` or `unhealthy`. The API's checks `GET /api/v1/health`, which pings the database. Compose uses health to order start-up (`service_healthy`), and the deploy script waits for `healthy` before declaring success. The worker container shares the API image but serves no HTTP, so its healthcheck is disabled explicitly.
+
+**17. Why encrypt backups to a public key instead of with a password stored on the server?**
+Because the threat model includes the server. If the password sits next to the backups, whoever compromises the server, or reads its `.env`, can decrypt every backup. With a public key the server can only encrypt. Decryption needs the private key, which never lives there. The trade-offs: the server can't verify its own backups by decrypting them (so restores are practised and tested in CI), and losing the private key loses every backup, so it's kept in two places.
+
+**18. Why pin GitHub Actions to commit SHAs?**
+A tag such as `v5` is a movable pointer. If the action's repository is compromised, the attacker can move the tag, and our workflow, holding a `packages: write` token, runs their code on the next push. A full SHA is immutable. Pinning creates update work, so Dependabot opens PRs that bump the SHA and the version comment together, and CI tests each one.
+
+**19. Your deploy user is in the docker group. Why is that a problem, and what did you do?**
+Access to the Docker socket is root-equivalent: `docker run -v /:/host` reads or writes anything. So the CI deploy key was effectively a root key. We pinned it to a forced command in `authorized_keys`. Whatever the client asks for, the server runs our gate script, which accepts only "upload these two config files" (after checking the images, privileges and mounts they ask for) and "deploy this tag". The gate is root-owned so the key can't replace it. The remaining risk is someone who holds the key and can also push images to our registry.

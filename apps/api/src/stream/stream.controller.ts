@@ -1,5 +1,21 @@
-import { Controller, Get, Header, HttpCode, Param, ParseUUIDPipe, Post, StreamableFile } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Header,
+  HttpCode,
+  HttpException,
+  HttpStatus,
+  Logger,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Req,
+  Res,
+  StreamableFile,
+} from '@nestjs/common';
 import { SkipThrottle, Throttle } from '@nestjs/throttler';
+import type { Request, Response } from 'express';
+import { Transform } from 'node:stream';
 import { type AuthUser, CurrentUser, Public, Roles } from '../common/auth.decorators.js';
 import { type FileToSend, StreamService } from './stream.service.js';
 
@@ -14,6 +30,8 @@ const NO_STORE = 'private, no-store';
  */
 @Controller()
 export class StreamController {
+  private readonly logger = new Logger(StreamController.name);
+
   constructor(private readonly streams: StreamService) {}
 
   /**
@@ -25,8 +43,17 @@ export class StreamController {
   @HttpCode(200)
   @Roles('CHANNEL', 'ADMIN', 'UPLOADER')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
-  createPreview(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
-    return this.streams.createPreview(user, id);
+  async createPreview(
+    @CurrentUser() user: AuthUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.streams.createPreview(user, id);
+    // 202 Accepted: the newsroom's marked rendition is still being made (first view).
+    if (session.kind === 'preparing') {
+      res.status(HttpStatus.ACCEPTED).setHeader('Retry-After', String(session.retryAfterSec));
+    }
+    return session;
   }
 
   // ---------- HLS preview (video) ----------
@@ -78,13 +105,67 @@ export class StreamController {
     return toStreamable(await this.streams.thumbnail(token));
   }
 
-  /** Rate limited (default limit): downloads are large and only needed once. */
+  /**
+   * The buyer's delivery copy. Single-use links (see StreamService.download), 20 per
+   * minute per IP. `downloadCount` goes up once per download whose every byte was
+   * handed to the HTTP response (review M3); see `meterDownload`.
+   */
   @Get('files/download/:token')
   @Public()
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @Header('Cache-Control', NO_STORE)
-  async download(@Param('token') token: string): Promise<StreamableFile> {
-    return toStreamable(await this.streams.download(token));
+  async download(
+    @Param('token') token: string,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<StreamableFile> {
+    // Express answers HEAD with the GET handler: a HEAD (link checker, preview bot) must not use up the link.
+    if (req.method === 'HEAD') throw new HttpException('Use GET to download this file', HttpStatus.METHOD_NOT_ALLOWED);
+    const file = await this.streams.download(token);
+    if (file.sha256) {
+      // So the buyer can check the bytes: hex for humans, RFC 9530 Repr-Digest for tools.
+      res.setHeader('X-Content-SHA256', file.sha256);
+      res.setHeader('Repr-Digest', `sha-256=:${Buffer.from(file.sha256, 'hex').toString('base64')}:`);
+    }
+    const orderId = file.orderId;
+    if (!orderId) return toStreamable(file);
+    const metered = meterDownload(file, res, () => {
+      this.streams
+        .countCompletedDownload(orderId)
+        .catch((err: Error) => this.logger.warn(`Could not count download of ${orderId}: ${err.message}`));
+    });
+    return toStreamable(metered);
   }
+}
+
+/**
+ * Passes the file through a byte counter and calls `onComplete` once, when the response
+ * closes after every byte of the file went into it. Why not just 'finish'? A client that
+ * has all `Content-Length` bytes may close the connection before Node emits 'finish'
+ * (only 'close' then fires). A download aborted half-way never pushes all bytes, because
+ * the response stops pulling (backpressure), so it is not counted.
+ */
+export function meterDownload(file: FileToSend, res: Response, onComplete: () => void): FileToSend {
+  let sent = 0;
+  let done = false;
+  const meter = new Transform({
+    transform(chunk: Buffer, _enc, callback) {
+      sent += chunk.length;
+      callback(null, chunk);
+    },
+  });
+  file.stream.on('error', (err) => meter.destroy(err));
+  file.stream.pipe(meter);
+  const check = () => {
+    if (done || res.statusCode !== 200) return;
+    const complete = file.size !== undefined ? sent === file.size : res.writableFinished;
+    if (!complete) return;
+    done = true;
+    onComplete();
+  };
+  res.once('finish', check);
+  res.once('close', check);
+  return { ...file, stream: meter };
 }
 
 function toStreamable(file: FileToSend): StreamableFile {

@@ -1,6 +1,6 @@
 # Build plan and team rules
 
-How FirstFrame was built by a lead plus a team of AI agents, and the rules every builder follows. Keep it: it is also a good answer to "how did you organise the work?" in an interview.
+How Micky was built by a lead plus a team of AI agents, and the rules every builder follows. Keep it: it is also a good answer to "how did you organise the work?" in an interview.
 
 ## Workflow
 
@@ -54,7 +54,7 @@ Builders work in the same repository at the same time, so **each builder only cr
 - **Testing:**
   - Unit tests go next to the code as `*.spec.ts`.
   - E2E tests go in `test/` and use `test/helpers.ts`.
-  - Run your own e2e files against **your own** test database, so builders don't wipe each other's data: `TEST_DATABASE_URL=postgresql://firstframe:firstframe@localhost:5432/firstframe_test_<builder> TEST_REDIS_URL=redis://localhost:6379/<n> npx vitest run --config vitest.config.e2e.ts test/<your-file>`
+  - Run your own e2e files against **your own** test database, so builders don't wipe each other's data: `TEST_DATABASE_URL=postgresql://micky:micky@localhost:5432/micky_test_<builder> TEST_REDIS_URL=redis://localhost:6379/<n> npx vitest run --config vitest.config.e2e.ts test/<your-file>`
 - **Before finishing:** `npm run typecheck` must pass.
 - **Git:** do not commit. The lead commits after each wave.
 

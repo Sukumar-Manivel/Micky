@@ -16,7 +16,12 @@ export interface OrderView {
   amount: number;
   currency: 'INR';
   createdAt: string;
+  /** Until when an unpaid checkout can be paid (the quoted price is honoured until then). */
+  expiresAt: string;
   paidAt: string | null;
+  refundedAt: string | null;
+  /** Why the order is not (or no longer) PAID, e.g. the licence was sold meanwhile. */
+  statusReason: string | null;
   downloadCount: number;
   media: {
     id: string;
@@ -32,6 +37,8 @@ export interface CheckoutView {
   amount: number;
   currency: 'INR';
   provider: 'razorpay' | 'mock';
+  /** The checkout must be paid before this moment; later payments are refunded. */
+  expiresAt: string;
   razorpay?: { keyId: string; orderId: string };
   description: string;
 }
@@ -48,7 +55,10 @@ export function toOrderView(
     amount: order.amount,
     currency: 'INR',
     createdAt: order.createdAt.toISOString(),
+    expiresAt: order.expiresAt.toISOString(),
     paidAt: order.paidAt?.toISOString() ?? null,
+    refundedAt: order.refundedAt?.toISOString() ?? null,
+    statusReason: order.statusReason,
     downloadCount: order.downloadCount,
     media: {
       id: item.id,
@@ -57,22 +67,4 @@ export function toOrderView(
       thumbnailUrl: urls.thumbnailUrl(item),
     },
   };
-}
-
-/**
- * A safe download file name: the media title reduced to letters, digits and dashes,
- * plus the original file's extension. Example: "Fire near Gandhipuram!" + "IMG_1.MOV"
- * → "fire-near-gandhipuram.mov".
- */
-export function downloadFileName(title: string, originalName: string): string {
-  const base =
-    title
-      .normalize('NFKD')
-      .replace(/[^\w\s-]/g, '')
-      .trim()
-      .toLowerCase()
-      .replace(/[\s_-]+/g, '-')
-      .slice(0, 80) || 'firstframe-media';
-  const ext = /\.([A-Za-z0-9]{1,8})$/.exec(originalName)?.[1]?.toLowerCase();
-  return ext ? `${base}.${ext}` : base;
 }

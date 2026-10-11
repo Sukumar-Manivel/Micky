@@ -37,7 +37,7 @@ Research done on 10 October 2026 by three parallel research agents (free infrast
 ## Tax (consult a CA)
 
 - TDS under Section 194-O: 0.1% of payouts to each uploader; none for a resident individual under ₹5 lakh a year who has given PAN; 5% without PAN.
-- GST: an e-commerce operator that must collect TCS has to register regardless of turnover. Whether FirstFrame counts as one needs a CA's view.
+- GST: an e-commerce operator that must collect TCS has to register regardless of turnover. Whether Micky counts as one needs a CA's view.
 
 ## Law (consult a lawyer)
 

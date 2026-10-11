@@ -10,6 +10,8 @@ export interface LedgerEntryView {
   amount: number;
   note: string | null;
   createdAt: string;
+  /** When the row counts towards the withdrawable balance (in the future while a sale credit is held). */
+  availableAt: string;
   mediaTitle: string | null;
 }
 
@@ -35,6 +37,7 @@ export function toLedgerEntryView(
     amount: row.amount,
     note: row.note,
     createdAt: row.createdAt.toISOString(),
+    availableAt: row.availableAt.toISOString(),
     mediaTitle,
   };
 }

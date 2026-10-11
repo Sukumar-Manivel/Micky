@@ -2,14 +2,14 @@
 
 import { useState } from 'react';
 import { useAuth, useSignedInUser } from '@/components/auth-provider';
-import { PayoutStatusBadge } from '@/components/badges';
+import { Badge, PayoutStatusBadge } from '@/components/badges';
 import { EarningsCards } from '@/components/earnings-cards';
 import { useToast } from '@/components/toast';
 import { Alert, Button, EmptyState, Field, PageHeader, Pager, Panel, Skeleton, inputClass } from '@/components/ui';
 import { describeError, earningsApi } from '@/lib/api';
 import { LICENSE_LABEL, formatDate, formatDateTime } from '@/lib/format';
 import { formatINR, paiseToRupeeInput, rupeesToPaise } from '@/lib/money';
-import type { LedgerEntryType } from '@/lib/types';
+import type { EarningsSummary, LedgerEntryType, PayoutDetailsView } from '@/lib/types';
 import { useApi } from '@/lib/use-api';
 
 const PAGE_SIZE = 10;
@@ -19,6 +19,8 @@ const UPI_PATTERN = /^[a-zA-Z0-9._-]{2,}@[a-zA-Z][a-zA-Z0-9.]{1,}$/;
 
 const ledgerLabel: Record<LedgerEntryType, string> = {
   SALE_CREDIT: 'Sale',
+  SALE_REVERSAL: 'Sale refunded',
+  SALE_REINSTATEMENT: 'Sale reinstated',
   PAYOUT_DEBIT: 'Payout',
   PAYOUT_REVERSAL: 'Payout returned',
   ADJUSTMENT: 'Adjustment',
@@ -36,13 +38,14 @@ export function EarningsView() {
   return (
     <>
       <PageHeader title="Earnings">
-        You earn a share of every licence sold. Withdraw your balance to any UPI ID.
+        You earn a share of every licence sold. Each sale is held for a few days in case the buyer’s payment is
+        refunded or disputed; after that you can withdraw it to your UPI ID.
       </PageHeader>
       <div className="flex flex-col gap-8">
         {summary.error ? <Alert>{summary.error}</Alert> : <EarningsCards summary={summary.data} />}
         <div className="grid gap-6 lg:grid-cols-2">
-          <UpiPanel />
-          <PayoutRequestPanel balance={summary.data?.balance} onRequested={refreshAll} />
+          <UpiPanel details={summary.data?.payoutDetails} onSaved={refreshAll} />
+          <PayoutRequestPanel summary={summary.data} onRequested={refreshAll} />
         </div>
         <PayoutHistory key={payoutsVersion} />
         <SalesTable />
@@ -52,7 +55,7 @@ export function EarningsView() {
   );
 }
 
-function UpiPanel() {
+function UpiPanel({ details, onSaved }: { details: PayoutDetailsView | undefined; onSaved: () => void }) {
   const user = useSignedInUser();
   const { setUser } = useAuth();
   const toast = useToast();
@@ -63,15 +66,24 @@ function UpiPanel() {
 
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    const upiId = String(new FormData(e.currentTarget).get('upiId')).trim();
+    const form = new FormData(e.currentTarget);
+    const upiId = String(form.get('upiId')).trim();
+    const currentPassword = String(form.get('currentPassword') ?? '');
     if (!UPI_PATTERN.test(upiId)) return setError('Enter a UPI ID like yourname@okaxis.');
+    if (!currentPassword) return setError('Enter your account password to confirm.');
     setBusy(true);
     setError(null);
     try {
-      const { user: updated } = await earningsApi.setPayoutDetails(upiId);
+      const { user: updated, payoutDetails } = await earningsApi.setPayoutDetails(upiId, currentPassword);
       setUser(updated);
       setEditing(false);
-      toast('UPI ID saved', 'success');
+      toast(
+        payoutDetails.payoutsAllowedFrom
+          ? `UPI ID changed. Payouts resume ${formatDateTime(payoutDetails.payoutsAllowedFrom)}`
+          : 'UPI ID saved',
+        'success',
+      );
+      onSaved();
     } catch (err) {
       setError(describeError(err));
     } finally {
@@ -84,8 +96,15 @@ function UpiPanel() {
       <h2 id="upi-h" className="mb-3 text-xl font-bold">
         Where we send your money
       </h2>
+      {details?.payoutsAllowedFrom ? (
+        <Alert tone="caution">
+          Your UPI ID was changed {details.changedAt ? `on ${formatDateTime(details.changedAt)}` : 'recently'}. For your
+          safety, payouts are paused until {formatDateTime(details.payoutsAllowedFrom)}. If you did not make this change,
+          change your password and contact support now.
+        </Alert>
+      ) : null}
       {!editing && current ? (
-        <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
           <p>
             <span className="text-muted">UPI ID: </span>
             <strong className="[overflow-wrap:anywhere]">{current}</strong>
@@ -112,6 +131,25 @@ function UpiPanel() {
               className={inputClass}
             />
           </Field>
+          <Field
+            label="Your account password"
+            htmlFor="currentPassword"
+            hint={
+              current
+                ? 'Needed to change where your money goes. Payouts pause for a safety period (usually 24 hours) after a change.'
+                : 'Needed to confirm it is really you.'
+            }
+          >
+            <input
+              id="currentPassword"
+              name="currentPassword"
+              type="password"
+              autoComplete="current-password"
+              required
+              aria-describedby="currentPassword-hint"
+              className={inputClass}
+            />
+          </Field>
           {error ? <Alert>{error}</Alert> : null}
           <div className="flex gap-2">
             <Button type="submit" busy={busy}>
@@ -129,12 +167,15 @@ function UpiPanel() {
   );
 }
 
-function PayoutRequestPanel({ balance, onRequested }: { balance: number | undefined; onRequested: () => void }) {
+function PayoutRequestPanel({ summary, onRequested }: { summary: EarningsSummary | undefined; onRequested: () => void }) {
   const user = useSignedInUser();
   const toast = useToast();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const hasUpi = Boolean(user.uploader?.upiId);
+  // Only the available balance can be withdrawn: held sale credits are not money yet.
+  const balance = summary?.available;
+  const pausedUntil = summary?.payoutDetails.payoutsAllowedFrom ?? null;
   const canWithdraw = balance !== undefined && balance >= MIN_PAYOUT_PAISE;
 
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
@@ -167,9 +208,12 @@ function PayoutRequestPanel({ balance, onRequested }: { balance: number | undefi
         <Skeleton className="h-24" />
       ) : !hasUpi ? (
         <p className="text-muted">Add your UPI ID first, then you can withdraw.</p>
+      ) : pausedUntil ? (
+        <p className="text-muted">Payouts are paused until {formatDateTime(pausedUntil)} because your UPI ID was changed.</p>
       ) : !canWithdraw ? (
         <p className="text-muted">
-          You can withdraw once your balance reaches {formatINR(MIN_PAYOUT_PAISE)}. Your balance is {formatINR(balance)}.
+          You can withdraw once your available balance reaches {formatINR(MIN_PAYOUT_PAISE)}. It is {formatINR(balance)}
+          {summary && summary.onHold > 0 ? `, and ${formatINR(summary.onHold)} more is on hold` : ''}.
         </p>
       ) : (
         <form onSubmit={onSubmit} className="flex flex-col gap-3">
@@ -272,10 +316,19 @@ function SalesTable() {
                 {data.items.map((s) => (
                   <tr key={s.orderId} className="border-b border-line last:border-0">
                     <td className="py-2 pr-3">{formatDate(s.paidAt)}</td>
-                    <td className="py-2 pr-3">{s.mediaTitle}</td>
+                    <td className="py-2 pr-3">
+                      {s.mediaTitle}
+                      {s.status !== 'PAID' ? (
+                        <span className="ml-2">
+                          <Badge tone={s.status === 'DISPUTED' ? 'bad' : 'neutral'}>
+                            {s.status === 'DISPUTED' ? 'Disputed' : 'Refunded'}
+                          </Badge>
+                        </span>
+                      ) : null}
+                    </td>
                     <td className="py-2 pr-3">{s.buyerOrganization}</td>
                     <td className="py-2 pr-3">{LICENSE_LABEL[s.licenseType]}</td>
-                    <td className="tabular py-2 text-right font-bold">
+                    <td className={`tabular py-2 text-right font-bold ${s.status !== 'PAID' ? 'text-muted line-through' : ''}`}>
                       {formatINR(s.uploaderShare)}
                       <span className="block text-xs font-normal text-muted">of {formatINR(s.amount)}</span>
                     </td>
@@ -293,6 +346,8 @@ function SalesTable() {
 
 function LedgerTable() {
   const [page, setPage] = useState(1);
+  // Read the clock once per mount (render must stay pure); the summary cards show the live totals.
+  const [now] = useState(() => Date.now());
   const { data, error, loading } = useApi(`me/ledger?page=${page}`, () => earningsApi.ledger({ page, pageSize: PAGE_SIZE }));
   return (
     <Panel aria-labelledby="ledger-h">
@@ -322,7 +377,12 @@ function LedgerTable() {
                   <tr key={l.id} className="border-b border-line last:border-0">
                     <td className="py-2 pr-3 whitespace-nowrap">{formatDateTime(l.createdAt)}</td>
                     <td className="py-2 pr-3">{ledgerLabel[l.type]}</td>
-                    <td className="py-2 pr-3 text-muted">{l.mediaTitle ?? l.note ?? '—'}</td>
+                    <td className="py-2 pr-3 text-muted">
+                      {l.mediaTitle ?? l.note ?? '—'}
+                      {l.amount > 0 && new Date(l.availableAt).getTime() > now ? (
+                        <span className="block text-xs">On hold until {formatDate(l.availableAt)}</span>
+                      ) : null}
+                    </td>
                     <td className={`tabular py-2 text-right font-bold ${l.amount < 0 ? '' : 'text-verified'}`}>
                       {l.amount > 0 ? '+' : l.amount < 0 ? '−' : ''}
                       {formatINR(Math.abs(l.amount))}

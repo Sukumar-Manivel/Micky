@@ -8,8 +8,9 @@ import type { INestApplicationContext } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import type { Queue } from 'bullmq';
 import { eq } from 'drizzle-orm';
+import exifr from 'exifr';
 import { execFileSync } from 'node:child_process';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
@@ -21,11 +22,14 @@ import { incidents, media, orders, verifications } from '../src/db/schema.js';
 import { MediaProcessingService } from '../src/processing/media-processing.service.js';
 import { MediaProcessor } from '../src/processing/media.processor.js';
 import { MEDIA_QUEUE } from '../src/processing/processing.constants.js';
+import { previewKeys } from '../src/processing/preview-plan.js';
+import { StreamService } from '../src/stream/stream.service.js';
 import { VerifierUnavailableError } from '../src/processing/verifier.client.js';
 import { StorageService, storageKeys } from '../src/storage/storage.service.js';
 import { createWorkerContext } from '../src/worker.module.js';
 import { auth, createAdmin, db, resetDb, startApp } from './helpers.js';
 import { createUser, KOCHI, type TestUser } from './market.fixtures.js';
+import { IDENTIFYING_STRINGS, identifyingJpeg, pngDeclaring, WITNESS } from './media-fixtures.js';
 
 // ---------- Mock verifier ----------
 
@@ -90,7 +94,11 @@ function startMockVerifier(): Promise<{ server: Server; url: string }> {
 // ---------- Fixtures ----------
 
 let fixtureDir: string;
-const fx = {} as Record<'video' | 'video2' | 'portrait' | 'photo' | 'png' | 'notMedia' | 'corruptMp4' | 'bigPhoto', string>;
+const fx = {} as Record<
+  | 'video' | 'video2' | 'portrait' | 'photo' | 'png' | 'notMedia' | 'corruptMp4' | 'bigPhoto'
+  | 'witnessVideo' | 'witnessPhoto' | 'longVideo' | 'pixelBomb',
+  string
+>;
 
 function ffmpeg(args: string[]) {
   execFileSync('ffmpeg', ['-hide_banner', '-v', 'error', '-y', ...args]);
@@ -122,6 +130,32 @@ async function makeFixtures() {
   ffmpeg(['-f', 'lavfi', '-i', 'testsrc2=size=640x480', '-frames:v', '1', fx.photo]);
   fx.png = f('photo.png');
   ffmpeg(['-f', 'lavfi', '-i', 'smptebars=size=300x200', '-frames:v', '1', fx.png]);
+
+  // A phone clip that names its owner and device and says where it was shot (review H3).
+  fx.witnessVideo = f('witness.mov');
+  ffmpeg([
+    '-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=15:duration=2',
+    '-f', 'lavfi', '-i', 'sine=frequency=330:duration=2',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest',
+    '-movflags', 'use_metadata_tags',
+    '-metadata', `location=+${WITNESS.lat}+0${WITNESS.lng}/`,
+    '-metadata', `make=${WITNESS.make}`,
+    '-metadata', `model=${WITNESS.model}`,
+    '-metadata', `artist=${WITNESS.artist}`,
+    '-metadata', 'creation_time=2026-10-10T13:12:07Z',
+    fx.witnessVideo,
+  ]);
+  fx.witnessPhoto = f('witness.jpg');
+  await writeFile(fx.witnessPhoto, identifyingJpeg());
+  // 10 s of 720p: the preview must be 40% of it (4 s) at 360p (review H4).
+  fx.longVideo = f('ten-seconds.mp4');
+  ffmpeg([
+    '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=10:duration=10',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', fx.longVideo,
+  ]);
+  // A tiny PNG that declares 16000 × 16000 pixels: 1 GB of RAM if decoded (review M6).
+  fx.pixelBomb = f('bomb.png');
+  await writeFile(fx.pixelBomb, pngDeclaring(16_000, 16_000));
 
   fx.notMedia = f('evil.mp4'); // the name says mp4, the bytes say HTML
   await writeFile(fx.notMedia, '<!doctype html><script>alert(1)</script>'.repeat(10));
@@ -208,6 +242,7 @@ async function insertPaidOrder(mediaId: string) {
     status: 'PAID',
     provider: 'mock',
     providerOrderId: `mock_${randomUUID()}`,
+    providerPaymentId: `mock_pay_${randomUUID()}`,
     paidAt: new Date(),
   });
 }
@@ -587,15 +622,36 @@ describe('Processing (worker service, mock verifier)', () => {
     expect(incident.mediaCount).toBe(1);
 
     const channel = await createUser(app, 'CHANNEL', { channelStatus: 'APPROVED' });
+    // First view: the newsroom's own marked copy does not exist yet, so the API asks the
+    // worker for one (202). Here the worker service renders it directly.
+    const streams = app.get(StreamService);
+    streams.renderWaitMs = 300;
+    try {
+      await request(s).post(`/api/v1/market/media/${item.id}/preview`).set(auth(channel.accessToken)).expect(202);
+    } finally {
+      streams.renderWaitMs = 20_000;
+    }
+    expect(await processing.renderViewerPreview(item.id, channel.user.id)).toBe(true);
+
     const preview = await request(s).post(`/api/v1/market/media/${item.id}/preview`).set(auth(channel.accessToken)).expect(200);
     expect(preview.body.kind).toBe('hls');
-    const base = new URL(preview.body.playlistUrl).pathname.replace(/index\.m3u8$/, '');
-    const m3u8 = await request(s).get(`${base}index.m3u8`).expect(200);
+    const playlistPath = new URL(preview.body.playlistUrl).pathname;
+    const m3u8 = await request(s).get(playlistPath).expect(200);
     expect(m3u8.text).toContain('#EXTM3U');
-    const key = await request(s).get(`${base}key.bin`).buffer(true).expect(200);
+    const resolve = (rel: string) => new URL(rel, `http://x${playlistPath}`).pathname;
+    const keyPath = resolve(/URI="([^"]+)"/.exec(m3u8.text)![1]);
+    const segPath = resolve(m3u8.text.split('\n').find((l) => l.endsWith('seg_000.ts'))!);
+    const key = await request(s).get(keyPath).buffer(true).expect(200);
     expect(key.body.toString('hex')).toBe(row.hlsKeyHex);
-    const seg = await request(s).get(`${base}seg_000.ts`).buffer(true).expect(200);
+    const seg = await request(s).get(segPath).buffer(true).expect(200);
     expect(seg.body.length).toBeGreaterThan(1000);
+
+    // It is this newsroom's rendition, not the generic one the owner and admins see.
+    const root = path.resolve(app.get(AppConfig).storageLocalDir);
+    const own = await readFile(path.join(root, previewKeys.viewerDir(item.id, channel.user.id), 'seg_000.ts'));
+    const generic = await readFile(path.join(root, storageKeys.hlsDir(item.id), 'seg_000.ts'));
+    expect(Buffer.compare(seg.body, own)).toBe(0);
+    expect(Buffer.compare(own, generic)).not.toBe(0);
   });
 
   it('processes a photo: watermarked preview JPEG and thumbnail', { timeout: 60_000 }, async () => {
@@ -712,6 +768,129 @@ describe('Processing (worker service, mock verifier)', () => {
     await processing.process(one.id, { finalAttempt: false });
     await processing.process(two.id, { finalAttempt: false });
     expect((await loadMedia(one.id)).incidentId).toBe((await loadMedia(two.id)).incidentId);
+  });
+});
+
+describe('Privacy and limits (reviews H3, H4, M6)', () => {
+  /** Buys the media as a new newsroom, then downloads it the way the web app does. */
+  async function buyAndDownload(mediaId: string) {
+    const admin = await createAdmin(app);
+    const s = app.getHttpServer();
+    await request(s).post(`/api/v1/admin/media/${mediaId}/approve`).set(auth(admin.accessToken)).send({}).expect(200);
+    const channel = await createUser(app, 'CHANNEL', { channelStatus: 'APPROVED' });
+    const [order] = await db(app)
+      .insert(orders)
+      .values({
+        buyerId: channel.user.id,
+        mediaId,
+        licenseType: 'NON_EXCLUSIVE',
+        amount: 150000,
+        platformFee: 45000,
+        uploaderShare: 105000,
+        status: 'PAID',
+        provider: 'mock',
+        providerOrderId: `mock_${randomUUID()}`,
+        providerPaymentId: `mock_pay_${randomUUID()}`,
+        paidAt: new Date(),
+      })
+      .returning();
+    const link = await request(s).get(`/api/v1/orders/${order.id}/download`).set(auth(channel.accessToken)).expect(200);
+    const res = await request(s)
+      .get(new URL(link.body.url).pathname)
+      .buffer(true)
+      .parse((r, cb) => {
+        const chunks: Buffer[] = [];
+        r.on('data', (c: Buffer) => chunks.push(c));
+        r.on('end', () => cb(null, Buffer.concat(chunks)));
+      })
+      .expect(200);
+    const body = res.body as Buffer;
+    expect(res.headers['x-content-sha256']).toBe(createHash('sha256').update(body).digest('hex'));
+    return { body, headers: res.headers, fileName: link.body.fileName as string };
+  }
+
+  it('delivers a video without GPS, make, model or artist (the original keeps them, for admins)', { timeout: 90_000 }, async () => {
+    const u = await createUser(app, 'UPLOADER');
+    const item = await uploadOk(u, fx.witnessVideo);
+    await processing.process(item.id, { finalAttempt: false });
+
+    const { body, headers } = await buyAndDownload(item.id);
+    const row = await loadMedia(item.id);
+    expect(createHash('sha256').update(body).digest('hex')).not.toBe(row.checksum); // not the original
+    const file = path.join(fixtureDir, `delivered-${item.id}.mov`);
+    await writeFile(file, body);
+    const probe = JSON.parse(
+      execFileSync('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file]).toString(),
+    ) as { format: { tags?: Record<string, string> }; streams: { codec_type: string; tags?: Record<string, string> }[] };
+    const tags = [probe.format.tags ?? {}, ...probe.streams.map((st) => st.tags ?? {})];
+    const keys = tags.flatMap((t) => Object.keys(t).map((k) => k.toLowerCase()));
+    for (const banned of ['location', 'com.apple.quicktime.location.iso6709', 'make', 'model', 'artist']) {
+      expect(keys).not.toContain(banned);
+    }
+    for (const text of IDENTIFYING_STRINGS) expect(body.includes(text)).toBe(false);
+    expect(body.includes(String(WITNESS.lat))).toBe(false);
+    // Same pictures and sound, and the capture time is kept.
+    expect(probe.streams.map((st) => st.codec_type).sort()).toEqual(['audio', 'video']);
+    expect(probe.format.tags?.creation_time).toMatch(/^2026-10-10T13:12:07/);
+    expect(headers['content-type']).toBe('video/quicktime');
+
+    // Admins still have the untouched original (and its metadata) as evidence.
+    const original = await readFile(path.join(path.resolve(app.get(AppConfig).storageLocalDir), row.originalKey));
+    expect(original.includes(WITNESS.artist)).toBe(true);
+  });
+
+  it('delivers a photo without GPS, make, model, artist, XMP or serial, keeping orientation and capture time', { timeout: 60_000 }, async () => {
+    const u = await createUser(app, 'UPLOADER');
+    const item = await uploadOk(u, fx.witnessPhoto);
+    await processing.process(item.id, { finalAttempt: false });
+
+    const { body, headers } = await buyAndDownload(item.id);
+    expect(headers['content-disposition']).toBe('attachment; filename="Fire-at-the-Marine-Drive-market.jpg"');
+    for (const text of IDENTIFYING_STRINGS) expect(body.includes(text)).toBe(false);
+    const exif = (await exifr.parse(body, { tiff: true, exif: true, gps: true, xmp: true, iptc: true, ifd1: true })) as Record<
+      string,
+      unknown
+    >;
+    expect(exif.latitude).toBeUndefined();
+    expect(exif.GPSLatitude).toBeUndefined();
+    expect(exif.Make).toBeUndefined();
+    expect(exif.Model).toBeUndefined();
+    expect(exif.Artist).toBeUndefined();
+    expect(exif.creator).toBeUndefined();
+    expect(exif.Orientation).toBeTruthy(); // still shown upright
+    expect(exif.DateTimeOriginal).toBeTruthy();
+    // Still a JPEG that FFmpeg decodes, at the original size.
+    const file = path.join(fixtureDir, `delivered-${item.id}.jpg`);
+    await writeFile(file, body);
+    const size = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', file]).toString().trim();
+    expect(size).toBe('64,48');
+    // Duplicate detection still uses the original's checksum.
+    await upload(u.accessToken, fx.witnessPhoto).expect(409);
+  });
+
+  it('previews at most 40% of a clip, at 360p for short clips', { timeout: 90_000 }, async () => {
+    const u = await createUser(app, 'UPLOADER');
+    const item = await uploadOk(u, fx.longVideo);
+    await processing.process(item.id, { finalAttempt: false });
+
+    const root = path.resolve(app.get(AppConfig).storageLocalDir);
+    const playlist = await readFile(path.join(root, storageKeys.hlsPlaylist(item.id)), 'utf8');
+    const seconds = [...playlist.matchAll(/#EXTINF:([\d.]+)/g)].reduce((sum, m) => sum + Number(m[1]), 0);
+    expect(seconds).toBeGreaterThan(3.5);
+    expect(seconds).toBeLessThanOrEqual(4.2); // 40% of 10 s, not the whole clip
+    const mezzanine = path.join(root, previewKeys.mezzanine(item.id));
+    const info = execFileSync('ffprobe', [
+      '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', mezzanine,
+    ]).toString().trim();
+    expect(info).toBe('640,360');
+  });
+
+  it('refuses a photo that declares too many pixels (decompression bomb), before storing it', async () => {
+    const u = await createUser(app, 'UPLOADER');
+    const res = await upload(u.accessToken, fx.pixelBomb).expect(413);
+    expect(res.body.message).toMatch(/megapixels/);
+    expect(await db(app).select().from(media)).toHaveLength(0);
+    await expectTmpUploadsEmpty();
   });
 });
 

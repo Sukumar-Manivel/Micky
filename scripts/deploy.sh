@@ -2,8 +2,8 @@
 # Deploys (or rolls back to) one image tag ON THE SERVER. Called by
 # .github/workflows/deploy.yml over SSH; also safe to run by hand:
 #
-#   /opt/firstframe/scripts/deploy.sh 3f2c1ab...   # a commit SHA that deploy.yml built
-#   /opt/firstframe/scripts/deploy.sh latest
+#   /opt/micky/scripts/deploy.sh 3f2c1ab...   # a commit SHA that deploy.yml built
+#   /opt/micky/scripts/deploy.sh latest
 #
 # Steps: record the tag in .env -> pull images -> run migrations -> recreate
 # changed containers -> wait for the API health check -> prune old images.

@@ -1,8 +1,11 @@
 import type { NextConfig } from "next";
 
 // Response headers for every page. The API sets its own; these cover the web app's HTML.
+// The Content-Security-Policy is NOT here: it names the API origin, which is only known at
+// runtime (PUBLIC_API_URL), while these headers are frozen at build time. proxy.ts adds it per
+// request (lib/csp.ts builds it). X-Frame-Options stays for old browsers without frame-ancestors.
 const securityHeaders = [
-  // Do not let other sites put FirstFrame in a frame (clickjacking on "Buy licence").
+  // Do not let other sites put Micky in a frame (clickjacking on "Buy licence").
   { key: "X-Frame-Options", value: "DENY" },
   { key: "X-Content-Type-Options", value: "nosniff" },
   { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },

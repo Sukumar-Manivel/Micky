@@ -1,7 +1,7 @@
 [project]
-name = "firstframe-verifier"
+name = "micky-verifier"
 version = "0.1.0"
-description = "FirstFrame verifier: AI-likelihood score, C2PA provenance and perceptual hashes for uploaded media."
+description = "Micky verifier: AI-likelihood score, C2PA provenance and perceptual hashes for uploaded media."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }

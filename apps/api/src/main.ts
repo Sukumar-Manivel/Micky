@@ -19,7 +19,10 @@ export async function createApp() {
   const config = app.get(AppConfig);
 
   app.setGlobalPrefix('api/v1');
-  app.set('trust proxy', 1); // behind Caddy / Cloudflare: use the real client IP for rate limiting
+  // Number of proxies in front of the API (Caddy = 1), so req.ip is the real client IP for
+  // rate limiting. The API domain must stay "DNS only" in Cloudflare: proxied, every client
+  // would share Cloudflare's IPs. See TRUST_PROXY_HOPS in src/config/app-config.ts.
+  app.set('trust proxy', config.trustProxyHops);
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
   app.use(cookieParser());
   app.enableCors({ origin: config.corsOrigins, credentials: true });

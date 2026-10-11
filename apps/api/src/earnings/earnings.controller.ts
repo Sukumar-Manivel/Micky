@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Post, Put, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Ip,
+  Post,
+  Put,
+  Query,
+  Headers,
+} from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import {
   type AuthUser,
   CurrentUser,
@@ -14,12 +24,16 @@ import { EarningsService } from './earnings.service.js';
 export class EarningsController {
   constructor(private readonly earnings: EarningsService) {}
 
+  /** Needs the current password, so it is rate limited like login (password guessing). */
   @Put('payout-details')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   setPayoutDetails(
     @CurrentUser() user: AuthUser,
     @Body() dto: PayoutDetailsDto,
+    @Ip() ip: string,
+    @Headers('user-agent') userAgent: string | undefined,
   ) {
-    return this.earnings.setPayoutDetails(user, dto.upiId);
+    return this.earnings.setPayoutDetails(user, dto, { ip, userAgent });
   }
 
   @Get('earnings')

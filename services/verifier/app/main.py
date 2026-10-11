@@ -79,7 +79,7 @@ def create_app(settings: Settings | None = None, detector: Detector | None = Non
             load_task.cancel()
 
     app = FastAPI(
-        title="FirstFrame verifier",
+        title="Micky verifier",
         version=__version__,
         lifespan=lifespan,
         # Internal service: no public API docs.

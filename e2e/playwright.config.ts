@@ -1,4 +1,4 @@
-// Browser end-to-end tests for FirstFrame. See README.md in this folder.
+// Browser end-to-end tests for Micky. See README.md in this folder.
 //
 // The tests share one stack and one database (booted by global-setup.ts), and the money
 // path is a story whose steps depend on each other, so everything runs in one worker,

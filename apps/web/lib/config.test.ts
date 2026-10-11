@@ -21,7 +21,7 @@ describe('apiUrl', () => {
 
   it('prefers the runtime config set by /runtime-config.js', () => {
     vi.stubEnv('NEXT_PUBLIC_API_URL', 'http://build-time:4000');
-    vi.stubGlobal('window', { __FIRSTFRAME_CONFIG__: { apiUrl: 'https://runtime.example.com/' } });
+    vi.stubGlobal('window', { __MICKY_CONFIG__: { apiUrl: 'https://runtime.example.com/' } });
     expect(apiUrl()).toBe('https://runtime.example.com');
     expect(apiBase()).toBe('https://runtime.example.com/api/v1');
   });

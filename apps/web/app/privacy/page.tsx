@@ -22,9 +22,29 @@ export default function PrivacyPage() {
 
       <LegalSection id="who" title="Who sees what">
         <ul>
-          <li>Newsrooms never see a witness’s name, email or UPI ID. They see the footage preview, its place and time, and our checks.</li>
-          <li>A newsroom’s name is shown to witnesses on the sales they make, and is drawn as a watermark on previews it watches.</li>
-          <li>FirstFrame reviewers can see uploads and their full technical details to check them.</li>
+          <li>
+            Newsrooms never see a witness’s name, email or UPI ID. Before buying, they see a short, low-resolution,
+            watermarked preview, the place and time it was recorded, and our checks.
+          </li>
+          <li>
+            The place newsrooms see is rounded to about 100 metres, so it shows the street, not the spot where you stood.
+            Only you and Micky reviewers see the exact point.
+          </li>
+          <li>
+            When a newsroom buys a licence, it downloads the full-quality footage with the identifying details inside the
+            file removed: GPS location, phone make, model and serial number, owner or artist names, comments and similar
+            tags. The recording time is kept, because newsrooms need it. The untouched file you uploaded stays with
+            Micky, where only reviewers can see it, as evidence in case of a dispute.
+          </li>
+          <li>
+            Removing file details does not hide what the footage itself shows or says. If faces, voices, number plates or
+            your surroundings could identify you, think about that before uploading.
+          </li>
+          <li>
+            A newsroom’s name and a short account code are drawn into the picture of every preview it watches, so a
+            recording of a preview shows who made it. Witnesses also see which newsroom bought their footage.
+          </li>
+          <li>Micky reviewers can see uploads and their full technical details to check them.</li>
           <li>Payment details are handled by Razorpay. We never see card numbers.</li>
         </ul>
       </LegalSection>
@@ -38,7 +58,7 @@ export default function PrivacyPage() {
 
       <LegalSection id="rights" title="Your choices">
         <p>
-          You can ask to see, correct or delete your data. If you are shown in footage on FirstFrame and want it reviewed or
+          You can ask to see, correct or delete your data. If you are shown in footage on Micky and want it reviewed or
           removed, use the{' '}
           <Link href="/report" className="font-semibold underline">
             Report content

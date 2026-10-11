@@ -37,7 +37,7 @@ function buildForm(file: File, fields: UploadFields): FormData {
 function uploadErrorMessage(status: number, body: unknown): string {
   if (status === 413) return 'This file is too big. Videos can be up to 500 MB and photos up to 25 MB.';
   if (status === 415) return 'This file type is not supported. Use an MP4, MOV or WebM video, or a JPEG, PNG, HEIC or WebP photo.';
-  if (status === 409) return 'This exact file has already been uploaded to FirstFrame.';
+  if (status === 409) return 'This exact file has already been uploaded to Micky.';
   return errorMessageFromBody(body, status);
 }
 

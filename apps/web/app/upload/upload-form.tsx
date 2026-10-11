@@ -288,7 +288,7 @@ export function UploadForm() {
             </span>
           </label>
           <ul className="list-disc space-y-1 pl-12 text-sm text-muted">
-            <li>You keep the copyright. FirstFrame may store it and show newsrooms a watermarked preview.</li>
+            <li>You keep the copyright. Micky may store it and show newsrooms a watermarked preview.</li>
             <li>When a newsroom buys a licence, it may broadcast and publish the footage. You earn your share of each sale.</li>
             <li>An exclusive licence means only that newsroom can buy it after that.</li>
             <li>

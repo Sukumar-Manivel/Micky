@@ -19,7 +19,7 @@ export async function GET() {
 
   // JSON.stringify plus escaping "<" means the value cannot break out of the script.
   const json = JSON.stringify(config).replace(/</g, '\\u003c');
-  return new Response(`window.__FIRSTFRAME_CONFIG__=${json};\n`, {
+  return new Response(`window.__MICKY_CONFIG__=${json};\n`, {
     headers: {
       'Content-Type': 'application/javascript; charset=utf-8',
       // Short cache: cheap on repeat visits, and a changed URL is picked up within minutes.

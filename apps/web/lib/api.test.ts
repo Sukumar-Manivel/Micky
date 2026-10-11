@@ -23,6 +23,6 @@ describe('errorMessageFromBody', () => {
 describe('describeError', () => {
   it('uses the API message, and explains network failures', () => {
     expect(describeError(new ApiError(409, 'Already sold'))).toBe('Already sold');
-    expect(describeError(new TypeError('Failed to fetch'))).toMatch(/Could not reach FirstFrame/);
+    expect(describeError(new TypeError('Failed to fetch'))).toMatch(/Could not reach Micky/);
   });
 });

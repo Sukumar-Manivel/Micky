@@ -9,7 +9,7 @@ export function LegalPage({ title, intro, children }: { title: string; intro: Re
         <div className="text-lg text-muted">{intro}</div>
         <p className="rounded-lg border-l-4 border-caution bg-caution-soft px-4 py-3 text-sm font-semibold text-caution">
           Draft summary in plain language. The binding legal text will be reviewed by a lawyer and published here before
-          FirstFrame opens to the public.
+          Micky opens to the public.
         </p>
       </header>
       <div className="flex flex-col gap-8">{children}</div>

@@ -2,6 +2,8 @@
 
 // Shows both licence options and runs checkout:
 //   POST /orders → (razorpay) open Razorpay Checkout → POST /orders/:id/verify
+//                  (if the payment is authorised but not captured yet, poll GET /orders/:id briefly:
+//                   the licence is granted only once the money is captured)
 //                → (mock)     show a clearly labelled test dialog → POST /orders/:id/mock-pay
 // then shows success with a download button.
 
@@ -84,7 +86,7 @@ export function LicensePanel({ media, onPurchased }: { media: MediaMarketView; o
         prefill: { email: user.email, name: user.name },
       });
       const order = await ordersApi.verify(checkout.orderId, res.razorpay_payment_id, res.razorpay_signature);
-      finish(order);
+      finish(order.status === 'CREATED' ? await waitForCapture(order) : order);
     } catch (err) {
       setStage({ kind: 'choose' });
       if (!(err instanceof PaymentCancelled)) setError(describeError(err));
@@ -97,7 +99,7 @@ export function LicensePanel({ media, onPurchased }: { media: MediaMarketView; o
       onPurchased();
     } else {
       setStage({ kind: 'choose' });
-      setError('The payment did not complete. If money was taken, it will be refunded automatically.');
+      setError(outcomeMessage(order));
     }
   }
 
@@ -166,6 +168,42 @@ export function LicensePanel({ media, onPurchased }: { media: MediaMarketView; o
       ) : null}
     </Panel>
   );
+}
+
+const CAPTURE_POLL_MS = 2_000;
+const CAPTURE_WAIT_MS = 30_000;
+
+/** The bank authorised the payment; Razorpay usually captures it within seconds. */
+async function waitForCapture(order: OrderView): Promise<OrderView> {
+  const deadline = Date.now() + CAPTURE_WAIT_MS;
+  let current = order;
+  while (current.status === 'CREATED' && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, CAPTURE_POLL_MS));
+    current = await ordersApi.get(order.id);
+  }
+  return current;
+}
+
+/** What to tell a buyer whose order did not end up PAID. Never promises more than the system does. */
+function outcomeMessage(order: OrderView): string {
+  switch (order.status) {
+    case 'CREATED':
+      return (
+        'We have not received confirmation of your payment yet. If you were charged, the licence appears under ' +
+        'Purchases within a few minutes. If it cannot be granted, a full refund is requested for you.'
+      );
+    case 'REFUND_PENDING':
+    case 'REFUNDED':
+    case 'REFUND_FAILED':
+      return (
+        `${order.statusReason ?? 'This licence could not be granted'}. A full refund of your payment has been requested; ` +
+        'banks usually take 5–7 working days to show it. Contact support if it has not arrived by then.'
+      );
+    case 'EXPIRED':
+      return 'This checkout expired. Please start a new purchase.';
+    default:
+      return 'The payment did not go through. Please try again.';
+  }
 }
 
 function DownloadButton({ orderId }: { orderId: string }) {

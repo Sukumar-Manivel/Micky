@@ -7,32 +7,47 @@
 //   returns a signed HLS playlist (video) or a signed image URL (photo) plus watermark text.
 // - Plays HLS with hls.js. Safari (and iOS) can play HLS natively, so there we just set `src`.
 //   The stream is AES-128 encrypted; hls.js fetches the key from the signed URL and decrypts.
-// - Draws the viewer's organisation name over the picture, drifting around the frame, so a
-//   screen recording carries the name of whoever leaked it.
+// - For a newsroom, the pictures themselves carry its name and account code: the worker burns
+//   them into that newsroom's own copy of the preview on its first view (the API answers
+//   202 "preparing" meanwhile, and this player asks again). A saved stream or a screen
+//   recording therefore names whoever leaked it. The text drawn on top here is extra.
 // - Turns off the browser's easy ways to save it (download button, right-click menu,
-//   picture-in-picture, casting). This is friction, not DRM: see docs/RESEARCH.md
-//   "Protecting previews". The real protection is that only a 480p, 30-second, watermarked
-//   preview ever reaches the browser before payment.
+//   picture-in-picture, casting). This is friction, not DRM: anyone can still record the
+//   screen. The real protection is what reaches the browser before payment: at most 40% of
+//   the clip (30 s max), at 360p for short clips (480p otherwise), photos at 640 px, all
+//   with burned-in marks. After an exclusive sale, other newsrooms get no preview (410).
 // - Signed URLs expire after about 10 minutes, so it fetches a new session shortly before
 //   `expiresAt` (and on a playback error caused by an expired token) and resumes where it was.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type Hls from 'hls.js';
-import { describeError, marketApi } from '@/lib/api';
+import { ApiError, describeError, marketApi } from '@/lib/api';
 import { createHlsErrorPolicy, unplayableMessage } from '@/lib/hls-errors';
 import type { MediaType, PreviewSession } from '@/lib/types';
 import { Button, Skeleton } from './ui';
 
 /** Refresh this long before the URLs expire, so playback never hits a dead link. */
 const REFRESH_MARGIN_MS = 45_000;
+/** How many times to ask again while the newsroom's marked copy is being prepared (202). */
+const MAX_PREPARING_POLLS = 40;
+
+/** POST /preview answers 202 with this while the worker renders a newsroom's marked copy. */
+type PreparingSession = { kind: 'preparing'; retryAfterSec: number };
 
 /** Who is watching decides the caption: a buyer, the uploader themselves, or a reviewer. */
 export type PreviewAudience = 'buyer' | 'owner' | 'admin';
 
 const CAPTION: Record<PreviewAudience, string> = {
-  buyer: 'Watermarked preview with your newsroom’s name, at reduced quality. Buy a licence to download the clean original.',
-  owner: 'This is the watermarked preview newsrooms see. Your original file stays private until a newsroom buys a licence.',
+  buyer:
+    'Preview with your newsroom’s name and account code burned into the picture, at reduced quality. Buy a licence to download the full-quality file without watermarks.',
+  owner:
+    'This is the watermarked preview. Each newsroom sees its own copy with its name burned in. Newsrooms get the full file only after buying a licence, with your name, GPS and phone details removed from it.',
   admin: 'Watermarked review preview. The original file is never sent to the browser here.',
+};
+
+const LENGTH_NOTE: Record<MediaType, string> = {
+  VIDEO: ' Video previews show at most 40% of the clip (never more than 30 seconds), at 360p or 480p.',
+  PHOTO: ' Photo previews are at most 640 pixels wide.',
 };
 
 export function PreviewPlayer({
@@ -48,6 +63,13 @@ export function PreviewPlayer({
 }) {
   const [session, setSession] = useState<PreviewSession | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** No "Try again" when retrying cannot help (the preview was closed by an exclusive sale). */
+  const [final, setFinal] = useState(false);
+  const [preparing, setPreparing] = useState(false);
+  /** Bumped to ask again while the marked copy is being prepared. */
+  const [pollTick, setPollTick] = useState(0);
+  const polls = useRef(0);
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const resumeAt = useRef(0);
   const wasPlaying = useRef(false);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -59,19 +81,47 @@ export function PreviewPlayer({
       resumeAt.current = v.currentTime;
       wasPlaying.current = !v.paused;
     }
+    if (pollTimer.current) clearTimeout(pollTimer.current);
     try {
-      setSession(await marketApi.preview(mediaId));
+      const next = (await marketApi.preview(mediaId)) as PreviewSession | PreparingSession;
+      if (next.kind === 'preparing') {
+        // First view of this footage by this newsroom: its marked copy is being rendered.
+        polls.current += 1;
+        if (polls.current > MAX_PREPARING_POLLS) {
+          setPreparing(false);
+          setError('The preview is taking longer than usual to prepare. Please try again in a few minutes.');
+          return;
+        }
+        setPreparing(true);
+        pollTimer.current = setTimeout(() => setPollTick((t) => t + 1), Math.max(1, next.retryAfterSec) * 1000);
+        return;
+      }
+      polls.current = 0;
+      setPreparing(false);
+      setSession(next);
       setError(null);
+      setFinal(false);
     } catch (err) {
+      setPreparing(false);
+      setSession(null);
+      setFinal(err instanceof ApiError && err.status === 410);
       setError(describeError(err));
     }
   }, [mediaId]);
 
+  useEffect(
+    () => () => {
+      if (pollTimer.current) clearTimeout(pollTimer.current);
+    },
+    [],
+  );
+
   useEffect(() => {
-    // Fetching on mount is a legitimate effect: we synchronise with an external system (the API).
+    // Fetching on mount (and again while the marked copy is being prepared) is a legitimate
+    // effect: we synchronise with an external system (the API).
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void load();
-  }, [load]);
+  }, [load, pollTick]);
 
   // Schedule the next refresh just before this session expires.
   useEffect(() => {
@@ -93,9 +143,23 @@ export function PreviewPlayer({
         {error ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-white">
             <p className="font-semibold">{error}</p>
-            <Button variant="secondary" size="sm" onClick={() => void load()}>
-              Try again
-            </Button>
+            {final ? null : (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => {
+                  polls.current = 0;
+                  void load();
+                }}
+              >
+                Try again
+              </Button>
+            )}
+          </div>
+        ) : preparing && !session ? (
+          <div role="status" className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center text-white">
+            <p className="font-semibold">Preparing your newsroom’s copy of the preview…</p>
+            <p className="text-sm text-white/70">Your organisation’s name is being added to the picture. This takes a few seconds.</p>
           </div>
         ) : !session ? (
           <Skeleton className="h-full w-full rounded-none" />
@@ -130,12 +194,12 @@ export function PreviewPlayer({
       <figcaption className="flex flex-col gap-1 text-sm text-muted">
         <span>
           {CAPTION[audience]}
-          {type === 'VIDEO' ? ' Video previews are at most 30 seconds.' : ''}
+          {LENGTH_NOTE[type]}
         </span>
         {audience === 'buyer' ? (
           <span className="text-xs">
-            Saving is switched off in this player, but no website can stop a screen recording. That is why every preview
-            carries your organisation’s name and the date.
+            Saving is switched off in this player, but no website can stop a screen recording or a determined copy. That is
+            why your organisation’s name and account code are part of the picture itself: a copy shows where it came from.
           </span>
         ) : null}
       </figcaption>

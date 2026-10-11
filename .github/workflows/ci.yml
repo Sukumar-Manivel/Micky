@@ -1,4 +1,4 @@
-# Continuous integration: lint, typecheck, test and build every part of FirstFrame.
+# Continuous integration: lint, typecheck, test and build every part of Micky.
 # Runs on pull requests and on pushes to branches other than main. Pushes to
 # main run it through deploy.yml (workflow_call), so main is tested exactly once
 # and nothing is deployed unless this passes.
@@ -36,12 +36,12 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: firstframe
-          POSTGRES_PASSWORD: firstframe
-          POSTGRES_DB: firstframe_test
+          POSTGRES_USER: micky
+          POSTGRES_PASSWORD: micky
+          POSTGRES_DB: micky_test
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U firstframe -d firstframe_test"
+          --health-cmd "pg_isready -U micky -d micky_test"
           --health-interval 5s --health-timeout 5s --health-retries 20
       redis:
         image: redis:7-alpine
@@ -50,10 +50,10 @@ jobs:
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -68,7 +68,7 @@ jobs:
       - name: E2E tests
         run: npm run test:e2e
         env:
-          TEST_DATABASE_URL: postgresql://firstframe:firstframe@localhost:5432/firstframe_test
+          TEST_DATABASE_URL: postgresql://micky:micky@localhost:5432/micky_test
           TEST_REDIS_URL: redis://localhost:6379/1
       - name: Build
         run: npm run build
@@ -84,10 +84,10 @@ jobs:
       NEXT_TELEMETRY_DISABLED: "1"
       NEXT_PUBLIC_API_URL: https://api.example.com
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -97,7 +97,7 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - name: Cache Next.js build cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: apps/web/.next/cache
           key: next-${{ runner.os }}-${{ hashFiles('apps/web/package-lock.json') }}-${{ hashFiles('apps/web/**/*.ts', 'apps/web/**/*.tsx', 'apps/web/**/*.css') }}
@@ -112,10 +112,10 @@ jobs:
       run:
         working-directory: services/verifier
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -134,12 +134,12 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: firstframe
-          POSTGRES_PASSWORD: firstframe
-          POSTGRES_DB: firstframe
+          POSTGRES_USER: micky
+          POSTGRES_PASSWORD: micky
+          POSTGRES_DB: micky
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U firstframe -d firstframe"
+          --health-cmd "pg_isready -U micky -d micky"
           --health-interval 5s --health-timeout 5s --health-retries 20
       redis:
         image: redis:7-alpine
@@ -150,15 +150,15 @@ jobs:
     env:
       NEXT_TELEMETRY_DISABLED: "1"
       # global-setup.ts drops and recreates this database, then migrates and seeds it.
-      E2E_DATABASE_URL: postgresql://firstframe:firstframe@localhost:5432/firstframe_e2e
+      E2E_DATABASE_URL: postgresql://micky:micky@localhost:5432/micky_e2e
       E2E_REDIS_URL: redis://localhost:6379/13
       # The verifier runs from the runner's Python (installed below), without the AI model.
       E2E_PYTHON: python
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -166,7 +166,7 @@ jobs:
             apps/api/package-lock.json
             apps/web/package-lock.json
             e2e/package-lock.json
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -192,7 +192,7 @@ jobs:
         run: npx playwright test
       - name: Upload report, traces and stack logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: playwright-report
           path: |
@@ -202,11 +202,22 @@ jobs:
           retention-days: 7
 
   infra:
-    name: Infra (compose, shellcheck)
+    name: Infra (compose, Caddyfile, shellcheck, actionlint, backups)
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: micky
+          POSTGRES_PASSWORD: micky
+          POSTGRES_DB: micky
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U micky -d micky"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Validate compose files
@@ -224,6 +235,12 @@ jobs:
             caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
       - name: shellcheck
         run: shellcheck -x scripts/*.sh # preinstalled on GitHub's Ubuntu runners
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+      - name: Backup encrypt/restore round trip
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends age rclone postgresql-client
+          scripts/test-backups.sh
 
   docker:
     name: Docker build (${{ matrix.image }})
@@ -243,23 +260,23 @@ jobs:
             context: services/verifier
             build-args: PRELOAD_MODEL=false # CI only checks that it builds
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Build (linux/amd64, not pushed)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: ${{ matrix.context }}
           build-args: ${{ matrix.build-args }}
           platforms: linux/amd64
           push: false
           load: true
-          tags: firstframe-${{ matrix.image }}:ci
+          tags: micky-${{ matrix.image }}:ci
           cache-from: type=gha,scope=ci-${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=ci-${{ matrix.image }}
       - name: Smoke test the API image tools
         if: matrix.image == 'api'
         run: |
-          docker run --rm --entrypoint sh firstframe-api:ci -c \
+          docker run --rm --entrypoint sh micky-api:ci -c \
             'ffmpeg -hide_banner -filters | grep -q drawtext && ffprobe -version >/dev/null && fc-match -f "%{file}\n" "DejaVu Sans:bold" && test -f dist/worker.js && test -f dist/db/migrate.js && ls drizzle >/dev/null && id -u'

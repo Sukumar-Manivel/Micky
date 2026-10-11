@@ -1,6 +1,7 @@
 import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { and, asc, desc, eq, gte, inArray, lte, sql } from 'drizzle-orm';
 import ngeohash from 'ngeohash';
+import { publicCoordinate } from '../common/views.js';
 import { type Database, InjectDb } from '../db/db.module.js';
 import { type Category, incidents, media, verifications } from '../db/schema.js';
 import { RealtimeService } from '../realtime/realtime.service.js';
@@ -55,7 +56,7 @@ export class IncidentsService {
       // Serialise assignments. Without this, two workers processing two clips of
       // the same fire at the same moment could both see "no incident yet" and
       // create two. A transaction-scoped advisory lock is released on commit.
-      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('firstframe:assign-incident'))`);
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('micky:assign-incident'))`);
 
       const item = await tx.query.media.findFirst({ where: eq(media.id, mediaId) });
       if (!item) throw new NotFoundException(`Media ${mediaId} not found`);
@@ -98,8 +99,9 @@ export class IncidentsService {
             title: incidentTitle(item),
             category: item.category,
             geohash: item.geohash,
-            latitude: item.latitude,
-            longitude: item.longitude,
+            // Never the witness's exact point: incidents are shown to every newsroom.
+            latitude: publicCoordinate(item.latitude),
+            longitude: publicCoordinate(item.longitude),
             locationName: item.locationName,
             firstSeenAt: item.capturedAt,
             lastSeenAt: item.capturedAt,

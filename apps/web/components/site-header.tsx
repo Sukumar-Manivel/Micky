@@ -52,7 +52,7 @@ export function SiteHeader() {
         Skip to content
       </a>
       <div className="mx-auto flex h-16 w-full max-w-6xl items-center gap-4 px-4">
-        <Link href="/" className="shrink-0" aria-label="FirstFrame home">
+        <Link href="/" className="shrink-0" aria-label="Micky home">
           <Logo />
         </Link>
 

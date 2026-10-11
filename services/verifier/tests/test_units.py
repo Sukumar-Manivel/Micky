@@ -112,7 +112,7 @@ def test_hf_detector_load_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch) 
 
     # Never touch the network from tests, even if torch happens to be installed.
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    det = HuggingFaceDetector("firstframe/does-not-exist")
+    det = HuggingFaceDetector("micky/does-not-exist")
     det.load()  # must not raise
     assert det.loaded is False
     assert score_frames(det, [Image.new("RGB", (8, 8))]).available is False

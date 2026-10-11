@@ -2,7 +2,21 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import { eq } from 'drizzle-orm';
 import request from 'supertest';
 import type { MockInstance } from 'vitest';
-import { ledgerEntries, media, payouts, reports } from '../src/db/schema.js';
+import {
+  ledgerEntries,
+  media,
+  orders,
+  payouts,
+  refunds,
+  reports,
+  uploaderProfiles,
+} from '../src/db/schema.js';
+import {
+  PAYMENT_PROVIDER,
+  type PaymentProvider,
+} from '../src/orders/payments/payment-provider.js';
+import { OrdersService } from '../src/orders/orders.service.js';
+import { RefundsService } from '../src/orders/refunds.service.js';
 import { IncidentsService } from '../src/incidents/incidents.service.js';
 import { RealtimeService } from '../src/realtime/realtime.service.js';
 import {
@@ -19,7 +33,10 @@ import {
   createApprovedChannel,
   createIncident,
   createUploader,
+  drainCommerceQueue,
   insertMedia,
+  setUpi,
+  waitForOrderStatus,
 } from './orders.fixtures.js';
 
 describe('Admin (e2e)', () => {
@@ -42,6 +59,7 @@ describe('Admin (e2e)', () => {
     emit = vi
       .spyOn(app.get(RealtimeService), 'emitToChannels')
       .mockReturnValue(undefined);
+    await drainCommerceQueue(app);
   });
   beforeEach(async () => {
     await resetDb(app);
@@ -85,13 +103,11 @@ describe('Admin (e2e)', () => {
     await insertMedia(app, uploader.user.id, { status: 'PROCESSING' });
     await insertMedia(app, uploader.user.id, { status: 'REJECTED' });
     await buy(app, channel.accessToken, item.id, 'EXCLUSIVE');
-    await db(app)
-      .insert(payouts)
-      .values({
-        uploaderId: uploader.user.id,
-        amount: 300_00,
-        upiId: 'a.b@okaxis',
-      });
+    await db(app).insert(payouts).values({
+      uploaderId: uploader.user.id,
+      amount: 300_00,
+      upiId: 'a.b@okaxis',
+    });
     await db(app)
       .insert(reports)
       .values({ reporterEmail: 'r@test.local', reason: 'PRIVACY' });
@@ -100,7 +116,13 @@ describe('Admin (e2e)', () => {
     expect(res.body).toEqual({
       users: { uploaders: 1, channels: 2, pendingChannels: 1 },
       media: { processing: 1, inReview: 1, approved: 1, rejected: 1 },
-      orders: { paid: 1, revenue: 5_000_00, platformFees: 1_500_00 },
+      orders: {
+        paid: 1,
+        revenue: 5_000_00,
+        platformFees: 1_500_00,
+        disputed: 0,
+      },
+      refunds: { pending: 0, failed: 0 },
       payouts: { requested: 1, requestedAmount: 300_00 },
       reports: { open: 1 },
     });
@@ -302,18 +324,13 @@ describe('Admin (e2e)', () => {
   describe('payouts', () => {
     async function requestedPayout() {
       const uploader = await createUploader(app);
-      await db(app)
-        .insert(ledgerEntries)
-        .values({
-          uploaderId: uploader.user.id,
-          type: 'ADJUSTMENT',
-          amount: 1_000_00,
-        });
-      await request(server)
-        .put('/api/v1/me/payout-details')
-        .set(auth(uploader.accessToken))
-        .send({ upiId: 'ravi@oksbi' })
-        .expect(200);
+      await db(app).insert(ledgerEntries).values({
+        uploaderId: uploader.user.id,
+        type: 'ADJUSTMENT',
+        amount: 1_000_00,
+        note: 'Test opening balance',
+      });
+      await setUpi(app, uploader, 'ravi@oksbi').expect(200);
       const payout = await request(server)
         .post('/api/v1/me/payouts')
         .set(auth(uploader.accessToken))
@@ -340,6 +357,8 @@ describe('Admin (e2e)', () => {
         amount: 600_00,
         upiId: 'ravi@oksbi',
         uploader: { id: uploader.user.id, email: uploader.user.email },
+        upiChangedAt: null,
+        upiChangedRecently: false,
       });
 
       await asAdmin('post', `/payouts/${payout.id}/mark-paid`)
@@ -408,6 +427,219 @@ describe('Admin (e2e)', () => {
       )
         .send({ note: 'nope' })
         .expect(404);
+    });
+  });
+
+  it('flags payouts whose UPI ID was changed recently (M4)', async () => {
+    const uploader = await createUploader(app);
+    await db(app).insert(ledgerEntries).values({
+      uploaderId: uploader.user.id,
+      type: 'ADJUSTMENT',
+      amount: 1_000_00,
+      note: 'Test opening balance',
+    });
+    await setUpi(app, uploader, 'first@oksbi').expect(200);
+    await setUpi(app, uploader, 'second@oksbi').expect(200);
+    // The 24 h cooling-off is over, but the change is still recent for the admin.
+    const changedAt = new Date(Date.now() - 25 * 3600_000);
+    await db(app)
+      .update(uploaderProfiles)
+      .set({ upiChangedAt: changedAt })
+      .where(eq(uploaderProfiles.userId, uploader.user.id));
+    await request(server)
+      .post('/api/v1/me/payouts')
+      .set(auth(uploader.accessToken))
+      .send({ amount: 500_00 })
+      .expect(201);
+    const list = await asAdmin('get', '/payouts?status=REQUESTED').expect(200);
+    expect(list.body.items[0]).toMatchObject({
+      upiId: 'second@oksbi',
+      upiChangedAt: changedAt.toISOString(),
+      upiChangedRecently: true,
+    });
+  });
+
+  describe('refunds, disputes and adjustments (H1, H2)', () => {
+    /** A channel whose exclusive payment lost the race: its order is REFUND_PENDING. */
+    async function lostRace() {
+      const uploader = await createUploader(app);
+      const winner = await createApprovedChannel(app, 'Winner News');
+      const loser = await createApprovedChannel(app, 'Loser News');
+      const item = await insertMedia(app, uploader.user.id);
+      const slow = await request(server)
+        .post('/api/v1/orders')
+        .set(auth(loser.accessToken))
+        .send({ mediaId: item.id, licenseType: 'EXCLUSIVE' })
+        .expect(201);
+      await buy(app, winner.accessToken, item.id, 'EXCLUSIVE');
+      await request(server)
+        .post(`/api/v1/orders/${slow.body.orderId}/mock-pay`)
+        .set(auth(loser.accessToken))
+        .expect(409);
+      return { uploader, loser, item, orderId: slow.body.orderId as string };
+    }
+
+    it('lists refunds with buyer and media, and retries a failed one until it is processed', async () => {
+      const provider = app.get<PaymentProvider>(PAYMENT_PROVIDER);
+      const service = app.get(RefundsService);
+      const refundApi = vi
+        .spyOn(provider, 'refund')
+        .mockRejectedValue(new Error('gateway down'));
+      const enqueue = vi.spyOn(service, 'enqueue').mockResolvedValue(undefined);
+      let ctx: Awaited<ReturnType<typeof lostRace>>;
+      try {
+        ctx = await lostRace();
+        const [row] = await db(app)
+          .select()
+          .from(orders)
+          .where(eq(orders.id, ctx.orderId));
+        await expect(
+          service.process(row.providerPaymentId!, { finalAttempt: true }),
+        ).rejects.toThrow();
+      } finally {
+        refundApi.mockRestore();
+        enqueue.mockRestore();
+      }
+
+      const stats = await asAdmin('get', '/stats').expect(200);
+      expect(stats.body.refunds).toEqual({ pending: 0, failed: 1 });
+
+      const list = await asAdmin('get', '/refunds?status=FAILED').expect(200);
+      expect(list.body.total).toBe(1);
+      expect(list.body.items[0]).toMatchObject({
+        status: 'FAILED',
+        amount: 5_000_00,
+        attempts: 1,
+        lastError: 'gateway down',
+        order: {
+          id: ctx.orderId,
+          status: 'REFUND_FAILED',
+          licenseType: 'EXCLUSIVE',
+        },
+        media: { id: ctx.item.id, title: ctx.item.title },
+        buyer: { id: ctx.loser.user.id, organization: 'Loser News' },
+      });
+      expect(list.body.items[0].reason).toMatch(/licensed exclusively/);
+      await asAdmin('get', '/refunds?status=NOPE').expect(400);
+
+      const retried = await asAdmin(
+        'post',
+        `/refunds/${list.body.items[0].id}/retry`,
+      ).expect(200);
+      expect(retried.body).toEqual({
+        id: list.body.items[0].id,
+        status: 'PENDING',
+      });
+      await waitForOrderStatus(app, ctx.orderId, 'REFUNDED');
+      const [refund] = await db(app)
+        .select()
+        .from(refunds)
+        .where(eq(refunds.orderId, ctx.orderId));
+      expect(refund).toMatchObject({ status: 'PROCESSED', lastError: null });
+
+      // A processed refund cannot be retried; an unknown one is 404.
+      await asAdmin('post', `/refunds/${refund.id}/retry`).expect(409);
+      await asAdmin(
+        'post',
+        '/refunds/00000000-0000-4000-8000-000000000000/retry',
+      ).expect(404);
+    });
+
+    it('lists orders by status, e.g. disputed ones', async () => {
+      const uploader = await createUploader(app);
+      const channel = await createApprovedChannel(app, 'Disputing News');
+      const item = await insertMedia(app, uploader.user.id);
+      const order = await buy(app, channel.accessToken, item.id);
+      const [row] = await db(app)
+        .select()
+        .from(orders)
+        .where(eq(orders.id, order.id));
+      await app
+        .get(OrdersService)
+        .openDispute(row.providerPaymentId!, 'Chargeback (created)');
+
+      const stats = await asAdmin('get', '/stats').expect(200);
+      expect(stats.body.orders).toMatchObject({ paid: 0, disputed: 1 });
+      const list = await asAdmin('get', '/orders?status=DISPUTED').expect(200);
+      expect(list.body.total).toBe(1);
+      expect(list.body.items[0]).toMatchObject({
+        id: order.id,
+        status: 'DISPUTED',
+        statusReason: 'Chargeback (created)',
+        providerPaymentId: row.providerPaymentId,
+        buyer: { id: channel.user.id, organization: 'Disputing News' },
+        media: { id: item.id },
+      });
+      expect(
+        (await asAdmin('get', '/orders?status=PAID').expect(200)).body.total,
+      ).toBe(0);
+    });
+
+    it('writes a ledger ADJUSTMENT with a mandatory note and the admin as author', async () => {
+      const uploader = await createUploader(app);
+      const channel = await createApprovedChannel(app);
+      const post = (body: object) =>
+        asAdmin('post', '/ledger-adjustments').send(body);
+
+      await post({ uploaderId: uploader.user.id, amount: 500_00 }).expect(400); // no note
+      await post({
+        uploaderId: uploader.user.id,
+        amount: 0,
+        note: 'nothing',
+      }).expect(400);
+      await post({
+        uploaderId: uploader.user.id,
+        amount: 1.5,
+        note: 'half',
+      }).expect(400);
+      await post({ amount: 100, note: 'who?' }).expect(400);
+      await post({
+        uploaderEmail: channel.user.email,
+        amount: 100,
+        note: 'not an uploader',
+      }).expect(404);
+
+      const credit = await post({
+        uploaderEmail: uploader.user.email.toUpperCase(),
+        amount: 250_00,
+        note: 'Goodwill for a late payout',
+      }).expect(201);
+      expect(credit.body).toMatchObject({
+        type: 'ADJUSTMENT',
+        amount: 250_00,
+        note: 'Goodwill for a late payout',
+        uploaderId: uploader.user.id,
+      });
+      await post({
+        uploaderId: uploader.user.id,
+        amount: -300_00,
+        note: 'Recover a duplicate credit',
+      }).expect(201);
+
+      const rows = await db(app)
+        .select()
+        .from(ledgerEntries)
+        .where(eq(ledgerEntries.uploaderId, uploader.user.id));
+      expect(rows.map((r) => r.amount).sort()).toEqual([-300_00, 250_00]);
+      expect(rows.every((r) => r.createdBy !== null)).toBe(true);
+      // Balances may go negative; the uploader sees the adjustment with its note.
+      const summary = await request(server)
+        .get('/api/v1/me/earnings')
+        .set(auth(uploader.accessToken))
+        .expect(200);
+      expect(summary.body).toMatchObject({
+        balance: -50_00,
+        available: -50_00,
+      });
+      await request(server)
+        .post('/api/v1/admin/ledger-adjustments')
+        .set(auth(uploader.accessToken))
+        .send({
+          uploaderId: uploader.user.id,
+          amount: 100,
+          note: 'self-service',
+        })
+        .expect(403);
     });
   });
 

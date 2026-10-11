@@ -1,5 +1,6 @@
 import { decidePreviewAccess, type PreviewViewer } from './preview-access.js';
-import { downloadFileName, formatIst, SEGMENT_NAME } from './stream.service.js';
+import { deliveryFileName, downloadFileName } from '../common/views.js';
+import { formatIst, SEGMENT_NAME } from './stream.service.js';
 
 describe('decidePreviewAccess', () => {
   const owner = 'owner-id';
@@ -22,6 +23,14 @@ describe('decidePreviewAccess', () => {
     expect(
       decidePreviewAccess(viewer('CHANNEL', { channelStatus: 'PENDING' }), { uploaderId: owner, status: 'APPROVED' }),
     ).toBe('forbidden');
+  });
+
+  it('closes previews for other channels once an exclusive licence is sold', () => {
+    const sold = { uploaderId: owner, status: 'APPROVED' as const, exclusiveSold: true };
+    expect(decidePreviewAccess(viewer('CHANNEL'), sold)).toBe('sold');
+    expect(decidePreviewAccess(viewer('CHANNEL', { holdsExclusive: true }), sold)).toBe('ok');
+    expect(decidePreviewAccess(viewer('UPLOADER', { id: owner }), sold)).toBe('ok');
+    expect(decidePreviewAccess(viewer('ADMIN'), sold)).toBe('ok');
   });
 
   it('uploaders can preview their own media unless it was removed', () => {
@@ -50,14 +59,51 @@ describe('formatIst', () => {
   });
 });
 
-describe('downloadFileName', () => {
-  it('keeps only safe characters and the storage extension', () => {
-    expect(downloadFileName({ title: 'Fire at "Marine Drive" / Kochi!', originalKey: 'originals/x/source.mp4' })).toBe(
+describe('downloadFileName / deliveryFileName (one name for JSON and Content-Disposition)', () => {
+  const row = (title: string, originalKey: string, mimeType = 'video/mp4') => ({ title, originalKey, mimeType });
+  it('keeps only safe characters and the delivered file\'s extension', () => {
+    expect(deliveryFileName(row('Fire at "Marine Drive" / Kochi!', 'originals/x/source.mp4'))).toBe(
       'Fire-at-Marine-Drive-Kochi.mp4',
     );
-    expect(downloadFileName({ title: '../../etc/passwd', originalKey: 'originals/x/source.MOV' })).toBe(
-      'etcpasswd.mov',
+    expect(deliveryFileName(row('../../etc/passwd', 'originals/x/source.MOV', 'video/quicktime'))).toBe('etcpasswd.mov');
+    expect(deliveryFileName(row('!!!', 'originals/x/source.jpg', 'image/jpeg'))).toBe('micky-media.jpg');
+  });
+
+  it('names HEIC photos .jpg, because they are delivered as JPEG', () => {
+    expect(deliveryFileName(row('Flood at the bridge', 'originals/x/source.heic', 'image/heic'))).toBe(
+      'Flood-at-the-bridge.jpg',
     );
-    expect(downloadFileName({ title: '!!!', originalKey: 'originals/x/source.jpg' })).toBe('firstframe-media.jpg');
+  });
+
+  it('never takes an extension it does not trust', () => {
+    expect(downloadFileName('Clip', '.exe/../x')).toBe('Clip');
+  });
+});
+
+describe('meterDownload (review M3: count real downloads)', () => {
+  async function run(bytes: number, size: number, event: 'finish' | 'close', statusCode = 200) {
+    const { EventEmitter } = await import('node:events');
+    const { Readable, Writable } = await import('node:stream');
+    const { meterDownload } = await import('./stream.controller.js');
+    const res = Object.assign(new EventEmitter(), { statusCode, writableFinished: false });
+    let counted = 0;
+    const file = { stream: Readable.from([Buffer.alloc(bytes)]), size, contentType: 'video/mp4' };
+    const metered = meterDownload(file, res as never, () => counted++);
+    await new Promise<void>((resolve) =>
+      metered.stream.pipe(new Writable({ write: (_c, _e, cb) => cb() })).on('finish', () => resolve()),
+    );
+    res.emit(event);
+    res.emit('close');
+    return counted;
+  }
+
+  it('counts once when every byte went out, even if only "close" fires', async () => {
+    expect(await run(100, 100, 'finish')).toBe(1);
+    expect(await run(100, 100, 'close')).toBe(1);
+  });
+
+  it('does not count a download that stopped early, or an error response', async () => {
+    expect(await run(40, 100, 'close')).toBe(0);
+    expect(await run(100, 100, 'finish', 500)).toBe(0);
   });
 });

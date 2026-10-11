@@ -1,14 +1,14 @@
 # Payments, earnings and admin
 
-How FirstFrame takes money from news channels, keeps each uploader's share, pays uploaders out, and how admins moderate the platform. Code lives in `apps/api/src/orders`, `src/earnings`, `src/admin` and `src/reports`.
+How Micky takes money from news channels, keeps each uploader's share, pays uploaders out, and how admins moderate the platform. Code lives in `apps/api/src/orders`, `src/earnings`, `src/admin` and `src/reports`.
 
 ## What was built and why
 
 | Module | Routes | Job |
 |---|---|---|
-| **OrdersModule** | `POST /orders`, `/orders/:id/verify`, `/orders/:id/mock-pay`, `GET /orders`, `/orders/:id`, `/orders/:id/download`, `POST /payments/razorpay/webhook` | A channel buys a licence. The payment is confirmed and the uploader is credited. The buyer downloads the original. |
+| **OrdersModule** | `POST /orders`, `/orders/:id/verify`, `/orders/:id/mock-pay`, `GET /orders`, `/orders/:id`, `/orders/:id/download`, `POST /payments/razorpay/webhook`, plus the `commerce` BullMQ queue (refund jobs, housekeeping) | A channel buys a licence. The payment is confirmed and the uploader is credited. The buyer downloads the original. Money that cannot be kept is refunded; refunds and chargebacks made later revoke the sale. |
 | **EarningsModule** | `PUT /me/payout-details`, `GET /me/earnings`, `/me/ledger`, `/me/sales`, `POST`/`GET /me/payouts` | The uploader sees their money and asks to be paid by UPI. |
-| **AdminModule** | `/admin/*` | Stats, the review queue, approving news channels, paying out, and handling takedown reports. |
+| **AdminModule** | `/admin/*` | Stats, the review queue, approving news channels, paying out, the refund queue (with retry), disputed orders, ledger adjustments, and handling takedown reports. |
 | **ReportsModule** | `POST /reports` | A public form for complaints and takedown requests (required by the IT Rules). |
 
 ### The big design decision: collect, keep a ledger, pay out in batches
@@ -18,16 +18,16 @@ The first plan used **Razorpay Route**, which splits every payment automatically
 What we do instead:
 
 1. Collect the **full** payment into the platform's Razorpay account.
-2. Record the uploader's share (70% by default) as a `SALE_CREDIT` row in an **append-only ledger**.
-3. The uploader asks for a payout. We write a `PAYOUT_DEBIT` row straight away, so the same money can't be asked for twice.
+2. Record the uploader's share (70% by default) as a `SALE_CREDIT` row in an **append-only ledger**. The credit is **held** for 7 days (`EARNINGS_HOLD_DAYS`) before it can be withdrawn, because card payments can be refunded or charged back after the sale.
+3. The uploader asks for a payout from the **available** part of the balance. We write a `PAYOUT_DEBIT` row straight away, so the same money can't be asked for twice.
 4. An admin pays a **batch** of requests by UPI, then marks each one paid with the bank reference (UTR). If a payout can't be made, rejecting it writes a `PAYOUT_REVERSAL` that gives the money back.
 
-The ledger is the source of truth. You can rebuild any balance, at any moment in time, from its rows.
+The ledger is the source of truth. You can rebuild any balance, at any moment in time, from its rows. A refund or chargeback adds a negative `SALE_REVERSAL`; a won chargeback adds a `SALE_REINSTATEMENT`; an admin correction is an `ADJUSTMENT` with a mandatory note.
 
 ## How a purchase flows through the code
 
 ```
- Channel's browser            FirstFrame API                          Razorpay
+ Channel's browser            Micky API                          Razorpay
  ─────────────────            ──────────────                          ────────
  1. Click "Buy"     ──POST /orders──▶ OrdersController.create
                                       OrdersService.create
@@ -42,16 +42,20 @@ The ledger is the source of truth. You can rebuild any balance, at any moment in
                     ◀── {razorpay_payment_id, razorpay_signature} ─────────────────┘
  3. POST /orders/:id/verify ─▶ OrdersService.verify
                                 ├─ HMAC(stored order id | payment id, key_secret) == signature?
-                                └─ markPaid(orderId, paymentId)  ◀──┐
-                    ◀── OrderView (PAID)                            │  same method
+                                ├─ provider.fetchPayment() ─────────────────▶ payments.fetch
+                                │   captured? same order? same amount, INR?
+                                │   (only "authorized" → return CREATED; the webhook grants it)
+                                └─ markPaid(orderId, payment)  ◀────┐
+                    ◀── OrderView (PAID) or 409 "refund requested"  │  same method
                                                                     │
  4. (seconds later, server to server)                               │
                      POST /payments/razorpay/webhook ◀──────────────┼──── order.paid /
                        RazorpayWebhookController.handle             │     payment.captured
                         ├─ HMAC(raw body, webhook_secret) == X-Razorpay-Signature? else 400
-                        ├─ INSERT webhook_events(event id) ON CONFLICT DO NOTHING
+                        ├─ INSERT webhook_events(event id, sha256(body)) ON CONFLICT DO NOTHING
                         │    └─ already there → 200 "already processed"
                         └─ find order by providerOrderId → markPaid ─┘
+                           (also: payment.failed, refund.processed/failed, payment.dispute.*)
                      ──▶ 200 {received: true}
 
  5. GET /orders/:id/download ─▶ signed URL to /files/download/:token (15 min), downloadCount + 1
@@ -62,13 +66,39 @@ Steps 3 and 4 both happen for every payment, in either order, sometimes at the s
 ### Inside `markPaid` (one database transaction)
 
 1. `SELECT ... FROM media WHERE id = ? FOR UPDATE`. This locks the media row, so any other payment for the same media waits here.
-2. Re-read the order. If it is already `PAID`, return it unchanged.
-3. Re-check the licence rules (`licenceBlocker`). If the licence was sold in the meantime, set the order to `FAILED` and log `NEEDS REFUND`.
+2. Re-read the order. If it is already `PAID` by this payment, return it unchanged. If it was paid by a *different* payment, the buyer was charged twice: record a refund for the second payment.
+3. Was the payment made before `expires_at`? Do the licence rules (`licenceBlocker`) still hold? If not, the money cannot be kept: set the order to `REFUND_PENDING` with a `status_reason`, and insert a `refunds` row **in the same transaction**.
 4. `UPDATE orders SET status='PAID' ... WHERE id = ? AND status <> 'PAID'`.
-5. `INSERT INTO ledger_entries (SALE_CREDIT) ... ON CONFLICT DO NOTHING`. The partial unique index `ledger_one_credit_per_order_idx` allows at most one sale credit per order.
+5. `INSERT INTO ledger_entries (SALE_CREDIT, available_at = paid_at + 7 days) ... ON CONFLICT DO NOTHING`. The partial unique index `ledger_one_credit_per_order_idx` allows at most one sale credit per order.
 6. For an exclusive licence, set `media.exclusive_sold = true`.
 
-If anything throws, the whole transaction rolls back: you can never end up with a paid order and no credit, or the other way round.
+After the commit, a refund job is queued if step 2 or 3 recorded one. If anything throws, the whole transaction rolls back: you can never end up with a paid order and no credit, or a refund decision without a refund row.
+
+### Refunds (`orders/refunds.service.ts`, `orders/commerce.processor.ts`)
+
+"Record, then act":
+
+```
+markPaid tx:  orders → REFUND_PENDING, INSERT refunds(payment id UNIQUE, PENDING)   COMMIT
+after commit: queue.add('refund', { paymentId }, { jobId: 'refund-<paymentId>', attempts: 6, backoff 30 s… })
+job:          refunds row still PENDING? → attempts + 1
+              provider.refund({ paymentId, amount, receipt: refunds.id })
+                ├─ processed → refunds PROCESSED + order REFUNDED
+                ├─ pending   → store the gateway refund id; the refund.processed webhook finishes it
+                └─ throws    → BullMQ retries; after the 6th try: refunds FAILED, order REFUND_FAILED
+admin:        POST /admin/refunds/:id/retry → back to PENDING, queued again
+housekeeping: every 5 min: expire unpaid checkouts, re-queue refunds stuck in PENDING
+```
+
+Three layers make "refund this payment exactly once" hold even if the job runs twice: the unique `provider_payment_id` on `refunds`, the job id derived from the payment id, and the gateway call itself, which first looks for an existing refund carrying our receipt. The mock provider implements refunds too (instantly `processed`), so the whole flow runs in tests and demos.
+
+### After the sale: refunds made elsewhere and chargebacks
+
+A refund made in the Razorpay dashboard arrives as `refund.processed` for a payment we never asked to refund. A chargeback arrives as `payment.dispute.created`. Both run `OrdersService.revoke` in one transaction: lock the order, set `REFUNDED` or `DISPUTED`, and write a negative `SALE_REVERSAL` equal to the credit. Downloads check `status = 'PAID'` on every request, so the licence is revoked at once, including links already handed out. `payment.dispute.won` sets the order back to PAID and writes a `SALE_REINSTATEMENT`. The unique index on `(order_id, type)` means each of these rows can exist at most once per order, however many times the webhook arrives.
+
+### Checkout expiry
+
+A checkout can be paid for 30 minutes (`orders.expires_at`); the quoted price is honoured until then. Housekeeping marks unpaid ones `EXPIRED`. A payment is judged by **when the buyer paid** (the gateway's `created_at`), not by when we hear about it, so a delayed webhook for a payment made in time still grants the licence, and a payment made after expiry is refunded.
 
 ### Licence rules (`orders/licence-rules.ts`)
 
@@ -85,12 +115,31 @@ The same pure function runs when the order is created (to give a clear 409 early
 BEGIN
   SELECT pg_advisory_xact_lock(hashtext(:uploaderId))   -- one payout at a time per uploader
   UPI ID set?            else 400
-  balance = SUM(ledger_entries.amount WHERE uploader)
-  amount ≤ balance and ≥ MIN_PAYOUT_PAISE?   else 400
+  UPI ID changed less than PAYOUT_COOLDOWN_HOURS ago?   else 400
+  available = SUM(amount) of rows WHERE available_at <= now()     (earnings/ledger.ts)
+  amount ≤ available and ≥ MIN_PAYOUT_PAISE?   else 400
   INSERT payouts (REQUESTED)
   INSERT ledger_entries (PAYOUT_DEBIT, -amount)
 COMMIT                                                    -- lock released here
 ```
+
+### Changing the payout destination (`PUT /me/payout-details`)
+
+Where money goes is the most valuable thing to an attacker holding a stolen session. So changing the UPI ID:
+- needs the **current password** (403 if wrong, 10 attempts a minute), so a stolen access token is not enough;
+- starts a **cooling-off** (`PAYOUT_COOLDOWN_HOURS`, 24): no payout can be requested until it ends, which gives the real owner time to notice. The earnings page shows the change and the pause;
+- is **audited** in `payout_detail_changes` (old and new ID, IP, user agent), and admins see "UPI ID changed recently" on payouts requested within 7 days of a change.
+
+Setting the first UPI ID needs the password but has no pause: there is no earlier destination to divert money from. It takes the same advisory lock as payouts, so a change and a payout request never interleave.
+
+### Database guarantees (migration `0001`)
+
+The application already gets these right; the constraints make them hold when a future change gets them wrong:
+- `CHECK (amount > 0 AND platform_fee + uploader_share = amount AND currency = 'INR')` on orders, and `amount > 0` on payouts and refunds.
+- Ledger: amount never 0; the sign must match the type (credits and reinstatements +, reversals and debits −, adjustments either); sale rows need an `order_id`, payout rows a `payout_id`; an `ADJUSTMENT` needs a note.
+- Partial unique indexes: one PAID exclusive order per media, one PAID order per (buyer, media), one ledger row of each type per order and per payout. Double-crediting or double-reversing is impossible.
+- A trigger makes `ledger_entries` append-only: UPDATE and DELETE raise an error (an operator can open a maintenance window with `SET LOCAL micky.ledger_maintenance = 'on'`).
+- Every status that means "money was captured" (`PAID`, `REFUND_*`, `DISPUTED`) requires a `provider_payment_id`.
 
 ### Admin
 
@@ -133,12 +182,18 @@ Each layer alone would stop a double credit. Together they are defence in depth.
 
 ## Trade-offs and known limits
 
-- **A paid-but-unavailable order** (a lost race) is marked FAILED and logged `NEEDS REFUND`. Refunds are manual for now. Next step: call Razorpay's refund API automatically and record a `refunds` table.
-- **The early licence check isn't a reservation.** Two channels can both reach checkout for an exclusive licence. Only one payment wins. The alternative, holding a reservation for N minutes, blocks other buyers and needs expiry jobs.
-- **Abandoned checkouts are reused** for 30 minutes, if the price hasn't changed, to avoid piles of CREATED orders. Older ones simply stay CREATED; a cleanup job could mark them FAILED.
+- **The early licence check isn't a reservation.** Two channels can both reach checkout for an exclusive licence. Only one payment wins; the others are refunded automatically. The alternative, holding a reservation for N minutes, blocks other buyers.
+- **Abandoned checkouts are reused** while they have at least 10 of their 30 minutes left and the price hasn't changed. After 30 minutes they expire.
+- **Refunds can still fail for good** (for example the payment is too old for the gateway). They then wait in the admin's refund queue; the buyer sees "Refund delayed", never a promise that it happens by itself.
+- **A partial refund** made in the dashboard is treated as a full revocation of the licence (logged as a warning). Partial credit reversals are not modelled.
+- **After an exclusive sale is refunded or charged back**, `exclusive_sold` stays true: the buyer already had the original, so the media is not resold automatically. An admin decides.
+- **Balances can go negative** when a sale is reversed after its share was paid out. Future sales net it off; there is no clawback from the uploader's bank.
+- **Credits written before migration 0001** were made available immediately (no retroactive hold).
+- **The UPI-change alert is in-app only.** There is no email yet, so the owner only notices on the earnings page; the admin flag is the second line of defence.
+- **Refund jobs run in the API process**, not the worker: they are small HTTP calls, and this keeps the payment secrets out of the worker container.
 - **Payouts are manual** (admin pays by UPI, then enters the UTR). RazorpayX Payouts could automate this later. TDS (Section 194-O) is not yet deducted; consult a CA.
 - **Advisory-lock hash collisions:** two uploaders whose ids share a 32-bit hash briefly wait for each other. This is correct, just slightly slower.
-- The webhook rejects payments whose `amount` is below the order amount, as defence in depth (the amount is fixed when the Razorpay order is created).
+- The webhook never grants a licence when `amount` is missing, the currency is not INR, or the order belongs to another provider. A captured payment of the wrong amount is refunded (defence in depth: the amount is fixed when the Razorpay order is created).
 - A REMOVED (taken-down) media can no longer be downloaded, even by past buyers.
 
 ## Interview questions with model answers
@@ -156,7 +211,7 @@ We insert the `x-razorpay-event-id` into `webhook_events` (primary key) with `ON
 The HMAC covers exact bytes. Re-serialising parsed JSON can change whitespace, key order or number formatting, and then the check fails or checks the wrong thing. We enabled `rawBody` in Nest and verify `req.rawBody` before using `req.body`.
 
 **5. Two channels pay for the same exclusive licence at the same second. What happens?**
-Each `markPaid` starts a transaction and runs `SELECT ... FOR UPDATE` on the media row. The second one waits until the first commits. It then re-checks the rules, sees the media is `exclusiveSold`, marks its own order FAILED and logs it for a refund. Exactly one PAID order and one ledger credit result, and a concurrency test proves it.
+Each `markPaid` starts a transaction and runs `SELECT ... FOR UPDATE` on the media row. The second one waits until the first commits. It then re-checks the rules, sees the media is `exclusiveSold`, sets its own order `REFUND_PENDING` and records a refund in the same transaction. After commit a BullMQ job refunds the payment through the gateway, and the order becomes `REFUNDED`. Exactly one PAID order and one ledger credit result; a concurrency test with three buyers proves it, including the two refunds.
 
 **6. Why `SELECT FOR UPDATE` on the media row and not on the order row?**
 The conflict is between *different* orders for the same media. Locking each order would not stop two different orders from both succeeding. The media row is the shared resource they compete for.
@@ -195,3 +250,24 @@ A 403 confirms the order exists, which leaks information (for example, that a co
 - **Mock provider** behind the `PaymentProvider` interface for the main flow.
 - For Razorpay mode, start a dedicated app with test secrets, insert orders directly or stub `createOrder` with `vi.spyOn`, and sign webhook bodies ourselves with the test secret.
 - Unit-test the HMAC against signatures computed independently with `openssl`.
+
+**18. A buyer paid, but the licence was sold a second earlier. How do they get their money back?**
+The decision and the refund record are written in one transaction (`REFUND_PENDING` + a `refunds` row, unique per payment id). After commit, a BullMQ job keyed on the payment id calls the gateway's refund API, retrying with backoff. The gateway call looks for an existing refund with our receipt first, so a crash between "gateway refunded" and "we saved it" cannot refund twice. If all retries fail, the refund shows up in the admin's queue with a Retry button, and housekeeping re-queues anything stuck.
+
+**19. Why hold an uploader's earnings for 7 days?**
+Card payments can be refunded or charged back after the sale. Without a hold, a fraudster could buy their own footage with a stolen card and withdraw 70% before the chargeback arrives; the platform would lose 100% plus the fee. With the hold, most reversals arrive while the credit is still on hold, and the reversal simply cancels it.
+
+**20. What happens to the ledger when a sale is refunded after the uploader was paid?**
+We write a negative `SALE_REVERSAL` row, never edit the credit. The balance goes negative, and new sales net it off before anything else can be withdrawn. The row has the same `available_at` as the credit, so inside the hold the two cancel out in "on hold" without touching the available balance.
+
+**21. Why do you need a password to change the UPI ID if the user is already logged in?**
+A stolen session (an XSS, a leaked refresh cookie) is enough to read pages, but it should not be enough to redirect money. Re-authentication proves the person knows the password. The cooling-off period then gives the real owner time to notice, and the audit table records who changed it and from where.
+
+**22. The application already enforces the money rules. Why add database constraints?**
+Code changes; constraints don't forget. A future refactor, a manual SQL fix or a new endpoint can bypass the service logic, but not a `CHECK`, a unique index or a trigger. They turn a silent money bug into a loud error. For example `UNIQUE (order_id, type)` on the ledger makes a double credit or double reversal impossible whatever the code does.
+
+**23. Why is the webhook's body hash stored as well as the event id?**
+Razorpay signs the body but not the `x-razorpay-event-id` header. Someone who captured a signed body could resend it under a new event id and pass the id check. A unique SHA-256 of the raw body catches that; the handlers are idempotent anyway, as a third layer.
+
+**24. Why fetch the payment in `/verify` if the signature is already valid?**
+The checkout signature is issued when the payment is *authorised*. If it is never captured (manual capture, an expired capture window), Razorpay returns the money to the buyer, and we would have granted a licence and an uploader credit for money that never arrived. So we create orders with `payment_capture: true`, and `/verify` grants only when `payments.fetch` says `captured` for the right amount; otherwise the `payment.captured` webhook grants it later.

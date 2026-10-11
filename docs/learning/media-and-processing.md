@@ -1,6 +1,6 @@
 # Uploads, media processing and incidents
 
-This note covers the uploader's side of FirstFrame: how a phone video becomes a watermarked preview, a set of verification signals for the admin, and part of an "incident" that news channels can find.
+This note covers the uploader's side of Micky: how a phone video becomes a watermarked preview, a set of verification signals for the admin, and part of an "incident" that news channels can find.
 
 ## 1. What was built and why
 
@@ -10,8 +10,12 @@ This note covers the uploader's side of FirstFrame: how a phone video becomes a 
 | **ProcessingModule** (producer) | `src/processing/processing.module.ts`, `media-queue.service.ts` | Registers the BullMQ queue `media-processing`. `MediaQueue.enqueue(mediaId)` is all the API ever does with processing |
 | **Worker process** | `src/worker.ts`, `src/worker.module.ts` | A second Node process (no HTTP) that consumes the queue |
 | **MediaProcessor** (consumer) | `src/processing/media.processor.ts` | BullMQ worker: decides retry vs. give up, marks `FAILED` |
-| **MediaProcessingService** | `src/processing/media-processing.service.ts` | The pipeline: probe → previews → verify → incident → `IN_REVIEW` |
-| **FFmpeg wrappers** | `src/processing/ffmpeg.ts` | ffprobe, watermark PNG, encrypted HLS, watermarked JPEG, frame sampling |
+| **MediaProcessingService** | `src/processing/media-processing.service.ts` | The pipeline: probe → previews → verify → delivery copy → incident → `IN_REVIEW`; also per-newsroom preview renditions |
+| **FFmpeg wrappers** | `src/processing/ffmpeg.ts` | ffprobe, watermark PNG, mezzanine, encrypted HLS, watermarked JPEG, frame sampling, metadata stripping; pixel limit and timeouts on every call |
+| **Preview plan** | `src/processing/preview-plan.ts` | Pure rules: how long and how big a preview is, mark styles, the newsroom's mark text |
+| **Image files** | `src/processing/image-files.ts` | Pure JS: image size from the header (bomb check), and lossless removal of EXIF/XMP/IPTC from JPEG/PNG/WebP |
+| **Delivery copy** | `src/processing/delivery.ts` | Where the buyer's metadata-free copy lives, and which tags it may keep |
+| **PreviewRenderProcessor** | `src/processing/preview-render.processor.ts` | Second BullMQ consumer (`preview-render` queue): one newsroom's marked rendition at a time, plus the daily cache clean-up |
 | **Metadata helpers** | `src/processing/media-metadata.ts` | Pure functions: upright size, preview sizes, GPS/time/device from ffprobe tags and EXIF |
 | **Verifier client** | `src/processing/verifier.client.ts` | Calls the Python verifier; classifies failures as retryable or not |
 | **Risk + pHash** | `src/processing/risk.ts`, `phash.ts` | Turns evidence into signals and a LOW/MEDIUM/HIGH level; compares perceptual hashes |
@@ -40,10 +44,11 @@ None of this can happen inside the upload request: encoding a video takes second
    2. **Per-type size**: photos ≤ 25 MB → **413**.
    3. **Business rules**: `capturedAt` not more than 5 minutes in the future and not older than 30 days; default prices by type; exclusive ≥ non-exclusive.
    4. **SHA-256** of the file, streamed (`sha256File`). If a non-FAILED media has the same checksum → **409** "This file has already been uploaded".
-   5. **Store the original** at `originals/<id>/source.mp4` (`storageKeys.original`). The id is a UUID generated in Node, so the key is known before the row exists.
-   6. **Transaction**: `pg_advisory_xact_lock(hashtext(checksum))`, re-check the checksum, `INSERT` the row with `status = 'PROCESSING'` and a geohash (precision 6). If this fails, the stored original is deleted.
-   7. **Enqueue** `process-media` with `jobId = mediaId`. If Redis is down, the row and the file are removed and the client gets **503**, so nothing is left stuck in PROCESSING.
-   8. Return **201** `MediaOwnerView` (`common/views.ts: toMediaOwnerView`).
+   5. **Limits (review M6):** for photos, the width × height in the file's header must be ≤ 50 megapixels (**413**, read with `image-files.ts: imageDimensions`, nothing decoded). Per uploader (**429**): uploads still processing, uploads in the last hour, bytes in the last day (`UPLOAD_LIMITS`).
+   6. **Store the original** at `originals/<id>/source.mp4` (`storageKeys.original`). The id is a UUID generated in Node, so the key is known before the row exists.
+   7. **Transaction**: `pg_advisory_xact_lock(hashtext(checksum))`, re-check the checksum, `INSERT` the row with `status = 'PROCESSING'` and a geohash (precision 6). If this fails, the stored original is deleted.
+   8. **Enqueue** `process-media` with `jobId = mediaId`. If Redis is down, the row and the file are removed and the client gets **503**, so nothing is left stuck in PROCESSING.
+   9. Return **201** `MediaOwnerView` (`common/views.ts: toMediaOwnerView`).
 
 ### Processing: the worker picks up the job
 
@@ -54,11 +59,12 @@ None of this can happen inside the upload request: encoding a video takes second
 1. **Load the row.** If it is not PROCESSING any more (already done, or the uploader deleted it), return `'skipped'`.
 2. **Download the original** into a private temp dir (`mkdtemp`), deleted in `finally`.
 3. **Probe**:
-   - Video: `ffprobe` JSON → `media-metadata.ts: readVideoProbe`: duration, codec, **upright** size (a phone writes 1920×1080 plus "rotate −90°"), and capture metadata from container tags (`creation_time`, ISO 6709 location `+09.93+076.26/`, device make/model, encoder). No video track, unreadable file or longer than 10 minutes → `PermanentProcessingError`.
-   - Photo: `ffprobe` for the size, `firstFrameRotation` for the EXIF rotation FFmpeg will apply, and `exifr` for capture time, GPS, device and software.
+   - Video: `ffprobe` JSON → `media-metadata.ts: readVideoProbe`: duration, codec, **upright** size (a phone writes 1920×1080 plus "rotate −90°"), and capture metadata from container tags (`creation_time`, ISO 6709 location `+09.93+076.26/`, device make/model, encoder). No video track, unreadable file, larger than 4K or longer than 10 minutes → `PermanentProcessingError`.
+   - Photo: the header's pixel count again (`checkPhotoPixels`, ≤ 50 MP), then `ffprobe` for the size, `firstFrameRotation` for the EXIF rotation FFmpeg will apply, and `exifr` for capture time, GPS, device and software.
+   - Every FFmpeg/ffprobe call on an upload gets `-max_pixels 50000000` (FFmpeg refuses a larger frame before allocating it) and a timeout (`TIMEOUT` in `ffmpeg.ts`: probe 30 s, single frame 60 s, render 5 min).
 4. **Previews** (skipped if the row already has them from an earlier attempt):
-   - Video: a 16-byte random AES key, `encodeHlsPreview` at ≤ 854×480 for at most 30 s, upload of `index.m3u8` + `seg_*.ts` to `previews/<id>/hls/`. The key goes to `media.hls_key_hex`, **not** to storage.
-   - Photo: watermarked JPEG (long side ≤ 1280) at `previews/<id>/preview.jpg`.
+   - Video (`preview-plan.ts: videoPreviewPlan`): at most `min(30 s, 40% of the clip)` (at least 1 s); clips under 30 s at ≤ 640×360 with a denser, more opaque mark, longer ones at ≤ 854×480. `encodeMezzanine` makes a private MP4 (`previews/<id>/mezzanine.mp4`, never served) already cut, scaled and generically marked; `segmentHls` cuts it into AES-encrypted HLS **without re-encoding** (`-c copy`) at `previews/<id>/hls/` for the owner and admins. A 16-byte random AES key goes to `media.hls_key_hex`, **not** to storage.
+   - Photo: watermarked JPEG (long side ≤ 640) at `previews/<id>/preview.jpg`.
    - Both: a watermarked thumbnail (long side ≤ 480) at `previews/<id>/thumb.jpg`.
    - Then one `UPDATE` sets `previewKey`, `thumbKey`, `hlsKeyHex`, size and duration. These are exactly the keys `stream.service.ts` reads.
 5. **Verify** (skipped if a verifications row exists):
@@ -67,8 +73,9 @@ None of this can happen inside the upload request: encoding a video takes second
    - **Verifier down?** Network error or 5xx on a non-final attempt → throw, and BullMQ retries later. On the final attempt, or on a 4xx, continue with `verifierAvailable = false`; the reason is stored in `metadata.verifier.error` and `assessRisk` adds a `VERIFIER_UNAVAILABLE` warning.
    - **Duplicate search** (`findDuplicate`): compare the frame pHashes with those of every **earlier** upload, in batches of 1000; ≤ 8 differing bits on any pair of frames = duplicate. Black/flat frames are ignored (`isInformativePhash`).
    - `assessRisk` (pure function) → signals + risk level. **Upsert** the `verifications` row (`ON CONFLICT (media_id) DO UPDATE`).
-6. **Incident**: `IncidentsService.assignIncident(mediaId)` joins a nearby incident (same or neighbouring geohash cell, within 2 h) or creates one. It is idempotent: if `incidentId` is set, it returns it.
-7. **Publish**: `UPDATE media SET status = 'IN_REVIEW' WHERE id = $1 AND status = 'PROCESSING'`. This is the **commit point**: until it runs, the job can be retried safely. Because it is conditional, a media removed meanwhile stays REMOVED.
+6. **Delivery copy** (review H3, skipped if `metadata.delivery` exists): the file buyers download, without the witness's identity; see section 4b. Its SHA-256, size and type are merged into the verification's admin-only `metadata.delivery`.
+7. **Incident**: `IncidentsService.assignIncident(mediaId)` joins a nearby incident (same or neighbouring geohash cell, within 2 h) or creates one. It is idempotent: if `incidentId` is set, it returns it.
+8. **Publish**: `UPDATE media SET status = 'IN_REVIEW' WHERE id = $1 AND status = 'PROCESSING'`. This is the **commit point**: until it runs, the job can be retried safely. Because it is conditional, a media removed meanwhile stays REMOVED.
 
 The admin then sees it in `GET /admin/review-queue` (status IN_REVIEW, with full metadata). Approval (`admin.service.ts`) recomputes the incident and emits `media.approved` over Socket.IO.
 
@@ -104,7 +111,7 @@ The preview filter graph (`ffmpeg.ts: watermarkGraph`):
 [0:v] scale=852:480, setsar=1 [base];    ← input 0 = the video, scaled down
 [base][1:v] overlay=0:0, format=yuv420p  ← input 1 = a transparent PNG watermark of the same size
 ```
-- **The watermark PNG** (`makeWatermark`): "FIRSTFRAME PREVIEW" written many times on a transparent square, rotated 30° and cropped to the frame size. It is burned into the pixels, so it cannot be removed by hiding an HTML element.
+- **The watermark PNG** (`makeWatermark`): "MICKY PREVIEW" written many times on a transparent square, rotated 30° and cropped to the frame size. It is burned into the pixels, so it cannot be removed by hiding an HTML element.
 - **Rotation:** phones record landscape sensor data plus a "rotate 90°" flag. FFmpeg applies the flag automatically while decoding ("autorotate"), also for JPEG EXIF orientation. So we only use the rotation to compute the **upright** width and height; rotating again would turn the picture sideways.
 - **Encoding:** H.264 (`libx264 -preset veryfast -crf 28`) and AAC audio, the codecs every browser can play. `-map_metadata -1` removes the original's GPS and device tags from the preview.
 - **Sizes are even numbers** because H.264 with 4:2:0 colour stores colour at half resolution: an odd width cannot be halved.
@@ -115,7 +122,37 @@ The preview filter graph (`ffmpeg.ts: watermarkGraph`):
 - The player downloads the playlist, then the segments one by one over plain HTTP. That makes it start fast, seek cheaply and work through caches and CDNs.
 - `-force_key_frames` puts a keyframe every 4 s, so each segment starts with a full picture and can play on its own.
 - **AES-128:** FFmpeg encrypts every segment with our random 16-byte key. The playlist line `#EXT-X-KEY:METHOD=AES-128,URI="key.bin"` tells the player to fetch the key from the (token-protected) stream route. The key lives in the database, so copying the storage folder alone gives you useless bytes.
-- **It is not DRM:** the browser gets the key in the clear while the token is valid. The goal is to make the preview not worth stealing (480p, 30 s, watermark), not to make copying impossible.
+- **It is not DRM:** the browser gets the key in the clear while the token is valid, and `ffmpeg -i <playlist URL> -c copy` saves the stream. The goal is to make the preview not worth stealing (a fraction of the clip, small, marked) and to make any copy name its source (4c), not to make copying impossible.
+
+## 4b. What buyers download: the delivery copy (review H3)
+
+A phone's original file says a lot about the witness: EXIF `Artist`/`Copyright` (often the owner's name), GPS (often their home), `Make`/`Model` and body serial numbers (which link several uploads to one phone), MakerNotes, embedded thumbnails, XMP. Videos carry `location`, `make`, `model` tags and sometimes GPS telemetry tracks. Selling that file would hand a stranger the witness's identity and address.
+
+So the worker writes a second file next to the original, `originals/<id>/delivery.<ext>` (`delivery.ts: deliveryKey`), and **paid downloads serve only that file**. The untouched original stays in storage for admins and as evidence; duplicate detection keeps using the original's checksum.
+
+- **Video** (`ffmpeg.ts: stripVideoMetadata`): `-map 0:V -map 0:a? -map_metadata -1 -map_chapters -1 -sn -dn -c copy -fflags +bitexact`. Same audio and video bytes (no quality loss, seconds of work), only video/audio tracks (data tracks can carry per-frame GPS), no container or stream tags, no chapters, no FFmpeg version tag. The capture time is written back (`creation_time`): it is public in the marketplace anyway and newsrooms need it. The rotation is stream side data, not a tag, so portrait clips stay portrait.
+- **Photos** (`image-files.ts: stripImageMetadata`, pure JavaScript because exiftool is not installed): walks the file's structure and keeps only what is needed to display it: a **whitelist**, so a metadata block invented by next year's phones is dropped by default.
+  - JPEG: keeps JFIF, the ICC colour profile, Adobe's colour transform and every decoding segment; drops APP1 (EXIF, XMP), MPF/FlashPix, APP3–APP15 (IPTC, Photoshop), comments, and anything after the end-of-image marker (some phones append a second JPEG with its own EXIF).
+  - PNG: keeps the image and colour chunks; drops `tEXt`/`iTXt`/`zTXt` (author, XMP), `eXIf`, `tIME`.
+  - WebP: keeps the image chunks; drops `EXIF`/`XMP ` and clears their flags.
+  - Then writes back a tiny new EXIF block with only **Orientation** (without it a portrait photo shows sideways) and **DateTimeOriginal**. The compressed image data is copied byte for byte.
+  - HEIC (FFmpeg cannot clean it losslessly) is re-encoded as a high-quality JPEG with no metadata.
+- **Checked, not trusted:** after making the copy, the worker re-reads it (ffprobe for videos, exifr with every block enabled for photos). Any tag outside `ALLOWED_VIDEO_TAGS`/`ALLOWED_PHOTO_TAGS` throws: we refuse to sell a file rather than sell one that still identifies the witness.
+- The copy's SHA-256 is sent with the download (`X-Content-SHA256`, `Repr-Digest`) and shown to the buyer (`purchased.fileSha256`), so they can check what they received.
+- Media processed before this existed get the copy from a backfill job (`prepare-delivery`, queued by the worker on start); until then a download answers 409 "being prepared".
+- What it cannot do: remove what the pictures and sound themselves reveal (faces, voices, a street sign). The privacy page says so.
+
+## 4c. Per-newsroom preview renditions (review H4)
+
+The generic preview carries "MICKY PREVIEW", which says nothing about who saved a copy. So each newsroom gets **its own** rendition with `ORGANISATION · 1A2B3C4D` (organisation name and the first 8 hex digits of its user id) burned in, tiled at −25° over the generic +30° mark:
+
+1. The first `POST /market/media/:id/preview` by a newsroom queues `render-viewer-preview` on the separate `preview-render` queue (job id = media + viewer, so two tabs share one render).
+2. `PreviewRenderProcessor` (concurrency 1, next to the upload worker's one FFmpeg: two processes on two cores) calls `MediaProcessingService.renderViewerPreview`: download the mezzanine, overlay the newsroom's mark, encode with `libx264 -preset superfast -crf 30`, a bitrate cap and `-threads 2`, encrypt with the media's existing key, upload to `previews/<id>/v/<userId>/` with the playlist **last** (its presence means "ready").
+3. Photos: the 640 px preview gets the same second mark (`image.jpg`).
+4. The API waits up to 20 s for it, otherwise answers 202 and the player retries.
+5. A daily job deletes renditions older than 7 days and all renditions of removed or exclusively sold media (Redis sorted set index).
+
+**Measured cost** on a 2-core machine (the target is a 2-OCPU free VM), worst case = a 30 s, 480p preview: 2.5 s wall / 3.9 CPU-s and ~3 MB for clean footage, 7.9 s wall / 14.4 CPU-s and ~4.7 MB for very grainy footage; 360p previews of short clips take under 0.5 s. Rendering from the small mezzanine instead of the original is what keeps it this cheap.
 
 ## 5. Checksums vs perceptual hashes
 
@@ -165,13 +202,16 @@ The preview filter graph (`ffmpeg.ts: watermarkGraph`):
 |---|---|---|
 | Multer writes to the API's disk, then the file is copied to storage | Simple; works with local storage on one VM | **Direct-to-storage uploads**: the API returns a presigned S3/R2 URL (multipart, resumable), the browser uploads straight to storage, the API only gets a "done" callback. The API never touches the bytes |
 | Duplicate search scans every earlier pHash in batches | Correct and easy to explain; fine for tens of thousands of uploads | Index the hashes: split each 64-bit hash into 4 × 16-bit bands and index the bands (two hashes ≤ 3 bits apart must share a band), or a **BK-tree** / vector index. Or `bit_count(a # b)` in SQL to avoid moving data |
-| Previews encoded once at 480p | One rendition is enough for judging footage | Several renditions (240p/480p) with an HLS master playlist for adaptive bitrate on weak networks |
+| Previews at 360p/480p, one marked rendition per newsroom | Enough for judging footage; renditions are cheap at tens of newsrooms (4c) | Several renditions (240p/480p) with an HLS master playlist for adaptive bitrate on weak networks |
 | One queue for processing and the trend job | One consumer to run | Separate queues per job type, so a long encode never delays trend updates; a GPU or bigger box for the verifier |
 | Worker emits no realtime events | The Socket.IO server lives in the API process | Publish events through Redis (Socket.IO Redis adapter/emitter) so the worker's `incident.updated` reaches browsers |
 | `capturedAt` is the uploader's claim | Many files have no metadata at all | Already cross-checked against file metadata (signals); could also require it for HIGH-value listings |
 | HEIC needs FFmpeg 7+ | Ubuntu's FFmpeg 6.1 cannot decode HEIC | Upgrade FFmpeg, or convert HEIC with libheif before processing. Today such uploads end FAILED with a clear message |
 | One AES key and a constant IV for the whole preview | FFmpeg's simple key-info mode | Per-segment IVs (or key rotation with `-hls_flags periodic_rekey`). It barely matters here because previews are deterrence, not DRM |
 | Soft delete keeps the files | Reports and audits may need evidence | A retention job that purges originals of REMOVED/REJECTED media after N days |
+| Delivery copy facts in `verifications.metadata.delivery` | No schema change was allowed | Dedicated columns (`delivery_key`, `delivery_sha256`) so the download path does not read admin-only JSON |
+| Per-uploader quotas counted from the `media` table | No new table, exact | A Redis token bucket; BullMQ groups for a fair share of the worker per uploader |
+| Photo pixel check reads JPEG/PNG/WebP headers in JS | No decoder touches a hostile file | HEIC header parsing (today FFmpeg's `max_pixels` guards it) |
 
 ## 8. Interview questions with model answers
 
@@ -203,7 +243,7 @@ The preview filter graph (`ffmpeg.ts: watermarkGraph`):
    HLS splits a video into short segments listed in an `.m3u8` playlist; the player fetches them over plain HTTP. It starts fast, seeks cheaply, works with CDNs and is supported by hls.js and Safari. It also supports AES-128 encryption with a key URL, which we protect with a short-lived signed token and keep in the database, so stolen segment files are useless on their own.
 
 10. **How is the watermark applied, and why on the server?**
-    The worker draws "FIRSTFRAME PREVIEW" tiled diagonally on a transparent PNG and FFmpeg overlays it on every frame before encoding. Because it is in the pixels, a channel can't remove it with dev tools. The player additionally overlays a moving label with the viewer's organisation and time, so a leaked screen recording points back to its source.
+    The worker draws the text tiled diagonally on a transparent PNG and FFmpeg overlays it on every frame before encoding. Because it is in the pixels, a channel can't remove it with dev tools, and it survives saving the stream. There are two marks: the generic "MICKY PREVIEW" in every preview, and for each newsroom its own copy with its name and account code, rendered on its first view and cached. The player's moving overlay is extra; it is not in a ripped stream, which is exactly why the name had to go into the pixels.
 
 11. **How do you handle phone videos recorded in portrait?**
     Phones store landscape sensor data plus a rotation flag (display matrix). ffprobe reports the stored size and the rotation; I swap width and height for ±90° to get the upright size, and FFmpeg applies the rotation itself when decoding. A test uploads a portrait clip and checks the stored size is 240×426, not 426×240.
@@ -220,7 +260,16 @@ The preview filter graph (`ffmpeg.ts: watermarkGraph`):
 15. **How do you prevent a price change from racing a purchase?**
     The PATCH runs in a transaction that locks the media row with `SELECT ... FOR UPDATE` and checks for PAID orders. Marking an order PAID locks the same row, so the two operations are serialised: either the sale happens first and the price change gets 409, or the price changes first and the sale sees the new state.
 
-16. **What would you change to handle 10× the uploads?**
+16. **A newsroom buys a witness's photo. What does it learn about the witness?**
+    Only what the picture shows and when it was taken. The worker makes a delivery copy: for photos it walks the JPEG/PNG/WebP structure and keeps only the image data, colour profile, orientation and capture time, a whitelist so unknown blocks are dropped; for videos `-map_metadata -1 -map_chapters -1 -c copy` and only audio/video tracks. It then re-reads the copy and refuses to sell it if any other tag survived. The untouched original stays admin-only as evidence. The marketplace also rounds coordinates to about 100 m.
+
+17. **How do you stop a 1 MB image from taking down the worker?**
+    A PNG can declare 16000 × 16000 pixels: about 1 GB once decoded. The API reads width and height from the header in plain JavaScript and refuses more than 50 MP with 413 before storing anything; the worker checks again, and every FFmpeg call passes `-max_pixels` so the decoder refuses an oversized frame before allocating it. Videos over 4K or 10 minutes fail permanently, each FFmpeg call has a timeout, and each uploader has limits on uploads in flight, per hour and bytes per day.
+
+18. **How long is a preview, and why not "the first 30 seconds"?**
+    Most eyewitness clips are shorter than 30 s, so "first 30 s" gave non-paying newsrooms the whole story. Now it is `min(30 s, 40% of the clip)`, at 360p with heavier marks for short clips, and photos at 640 px. Enough to judge the footage, not enough to broadcast it.
+
+19. **What would you change to handle 10× the uploads?**
     Upload directly to object storage with presigned multipart URLs so the API never handles bytes; run more workers on separate machines (the queue already distributes jobs); split queues by job type; put the verifier on a GPU; index perceptual hashes (band hashing or a BK-tree) instead of scanning; serve previews through a CDN with signed URLs, keeping the key route on the API.
 
 ## 9. Testing
@@ -229,7 +278,7 @@ The preview filter graph (`ffmpeg.ts: watermarkGraph`):
   - `media/file-type.spec.ts`: every accepted signature, and rejections (HTML, PDF, WAV, AVIF, truncated files).
   - `processing/media-metadata.spec.ts`: preview sizes (even, never upscaled, portrait), rotation, ISO 6709 parsing, placeholder dates, iPhone-style ffprobe tags, EXIF with a UTC offset, and validation of the verifier's JSON.
   - `processing/phash.spec.ts`, `risk.spec.ts`, `incidents/trend.spec.ts`.
-- **E2E** (`test/media.e2e-spec.ts`, 46 tests). Fixtures are generated with FFmpeg at test time (test pattern videos, a portrait clip, photos, a corrupt MP4, an HTML file named `.mp4`, a 26 MB fake JPEG). The **verifier is a small HTTP server inside the test**, so the test controls AI scores and pHashes and can simulate it being down (503) or rejecting the token (401). Covered:
+- **E2E** (`test/media.e2e-spec.ts`, 50 tests). Fixtures are generated with FFmpeg at test time (test pattern videos, a portrait clip, photos, a corrupt MP4, an HTML file named `.mp4`, a 26 MB fake JPEG). The **verifier is a small HTTP server inside the test**, so the test controls AI scores and pHashes and can simulate it being down (503) or rejecting the token (401). Covered:
   - access rules, 17 validation cases (each also checks the temp file was deleted), 415, 413;
   - 201 response shape, stored original, queued job;
   - 409 duplicates, including two parallel uploads, and re-upload after FAILED;
@@ -237,4 +286,6 @@ The preview filter graph (`ffmpeg.ts: watermarkGraph`):
   - full processing of a video and a photo: HLS files and key, thumbnails, verification signals (location mismatch, re-encoded), incident creation, the admin queue, approval, and streaming the preview through the real stream routes;
   - near-duplicate detection, uninformative hashes ignored, verifier-down retry then degrade, 4xx not retried, no resurrection of removed media, clustering of two nearby uploads;
   - finally the **real BullMQ worker** consumes queued jobs: a good photo reaches IN_REVIEW, and a corrupt MP4 becomes FAILED after exactly one attempt.
+- **Privacy and limits** (`test/media.e2e-spec.ts`, "Privacy and limits"): a phone-style video and JPEG with the owner's name, device, serial and GPS are processed, bought and downloaded through the real routes; the delivered bytes contain none of those strings, ffprobe/exifr find no location/make/model/artist, orientation and capture time survive, and the original still has them. A 10 s 720p clip gets a 4 s, 640×360 preview. A PNG declaring 16000×16000 pixels is refused with 413 before anything is stored. The review-queue test checks the 202 "preparing" answer and that a newsroom streams its own rendition.
+- Unit: `image-files.spec.ts` (stripping each format, header sizes, minimal EXIF), `preview-plan.spec.ts` (preview length/size rules, mark text, delivery naming).
 - **Manual smoke test:** verifier + API + worker as three processes; register, upload a 12 s 720p MP4, IN_REVIEW in about 5 s, approve as admin, then fetch the playlist, key and segments through signed URLs and decode them with FFmpeg (852×480 H.264 + AAC, watermark visible).

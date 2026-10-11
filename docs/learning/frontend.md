@@ -1,6 +1,6 @@
 # Frontend (the web app)
 
-How the FirstFrame website works: one Next.js app serves three kinds of people (witnesses who upload, newsrooms who license, and admins who moderate). Code lives in `apps/web`. It is a Next.js 16 App Router app written in TypeScript and styled with Tailwind CSS v4. It is installable as a PWA.
+How the Micky website works: one Next.js app serves three kinds of people (witnesses who upload, newsrooms who license, and admins who moderate). Code lives in `apps/web`. It is a Next.js 16 App Router app written in TypeScript and styled with Tailwind CSS v4. It is installable as a PWA.
 
 ## What was built and why
 
@@ -80,11 +80,11 @@ Two details that come from **Cache Components** (`cacheComponents: true` in `nex
 
 **Single-flight refresh.** The API *rotates* the refresh token on every use and treats reuse of an old one as theft, revoking every session of that user. If five requests got a 401 at once and each refreshed, four would send an already-used cookie and log the user out. So `refresh()` keeps the in-flight promise in `inFlight`: the first caller starts it, everyone else awaits the same promise, and it is cleared in `finally`. `lib/session.test.ts` checks that three parallel calls produce one refresh request.
 
-**Across tabs.** Two tabs share one cookie, so two tabs refreshing at the same instant has the same problem. `withCrossTabLock` uses the Web Locks API (`navigator.locks.request('firstframe-refresh', …)`), so the second tab waits and then sends the new cookie.
+**Across tabs.** Two tabs share one cookie, so two tabs refreshing at the same instant has the same problem. `withCrossTabLock` uses the Web Locks API (`navigator.locks.request('micky-refresh', …)`), so the second tab waits and then sends the new cookie.
 
 **React integration.** `AuthProvider` exposes the store with `useSyncExternalStore`, React's built-in way to subscribe to state that lives outside React, without "tearing" (two components seeing different values in one render).
 
-**Typed API client (`lib/api.ts`).** One function per endpoint in `API.md` (`adminApi.approve`, `marketApi.media`, …), all going through `request()`. That function adds the bearer header, retries once after a refresh on 401, and turns NestJS error bodies (`message` as a string or an array) into an `ApiError` with readable text. `describeError` maps a `TypeError` from `fetch` (offline or CORS) to "Could not reach FirstFrame". The response types in `lib/types.ts` mirror `API.md` exactly.
+**Typed API client (`lib/api.ts`).** One function per endpoint in `API.md` (`adminApi.approve`, `marketApi.media`, …), all going through `request()`. That function adds the bearer header, retries once after a refresh on 401, and turns NestJS error bodies (`message` as a string or an array) into an `ApiError` with readable text. `describeError` maps a `TypeError` from `fetch` (offline or CORS) to "Could not reach Micky". The response types in `lib/types.ts` mirror `API.md` exactly.
 
 ## Role guards
 
@@ -174,7 +174,7 @@ A Progressive Web App is a website the phone can "install": an icon on the home 
 ## Deployment
 
 - `output: 'standalone'` makes `next build` write `.next/standalone/server.js` plus only the `node_modules` it needs. Copy `public/` and `.next/static/` next to it, then run `node server.js`. The Docker image doesn't need the full `node_modules`.
-- **The API address at runtime.** `NEXT_PUBLIC_*` variables are inlined into the JavaScript at build time, so one image could only ever talk to one API. Instead, `/runtime-config.js` is a dynamic route (`await connection()` stops it being prerendered) that reads `PUBLIC_API_URL` from the container's environment and returns `window.__FIRSTFRAME_CONFIG__ = {"apiUrl": …}`. The root layout loads it with a plain blocking `<script>` in `<head>`, so it has run before any app code. `lib/config.ts` reads it on each call: the runtime value first, then `NEXT_PUBLIC_API_URL`, then `http://localhost:4000`. The value is validated as an `http(s)` URL, and `<` is escaped so it can't break out of the script. All variables are documented in `apps/web/.env.example`.
+- **The API address at runtime.** `NEXT_PUBLIC_*` variables are inlined into the JavaScript at build time, so one image could only ever talk to one API. Instead, `/runtime-config.js` is a dynamic route (`await connection()` stops it being prerendered) that reads `PUBLIC_API_URL` from the container's environment and returns `window.__MICKY_CONFIG__ = {"apiUrl": …}`. The root layout loads it with a plain blocking `<script>` in `<head>`, so it has run before any app code. `lib/config.ts` reads it on each call: the runtime value first, then `NEXT_PUBLIC_API_URL`, then `http://localhost:4000`. The value is validated as an `http(s)` URL, and `<` is escaped so it can't break out of the script. All variables are documented in `apps/web/.env.example`.
 - `next.config.ts` adds security headers: `X-Frame-Options: DENY` (no clickjacking on "Buy licence"), `nosniff`, `Referrer-Policy`, and a `Permissions-Policy` that only allows geolocation.
 
 ## Performance choices
@@ -239,7 +239,7 @@ A determined one can capture what reaches its browser: screen-record it, or fetc
 A fixed watermark in a corner can be cropped or blurred out of a recording. A moving one crosses the whole picture over time. Putting the viewer's own organisation name on it turns a leak into evidence of who leaked it, which is a strong deterrent. (The server also burns a watermark into thumbnails and photo previews.)
 
 **10. How did you make one Docker image work for staging and production?**
-`NEXT_PUBLIC_*` values are frozen at build time. We added a dynamic route, `/runtime-config.js`, that reads `PUBLIC_API_URL` when the request arrives and sets `window.__FIRSTFRAME_CONFIG__`. The root layout loads it before the app's code, and `apiUrl()` reads it on every call, falling back to the build-time value. With `output: 'standalone'`, the image only contains `server.js` and the files it actually needs.
+`NEXT_PUBLIC_*` values are frozen at build time. We added a dynamic route, `/runtime-config.js`, that reads `PUBLIC_API_URL` when the request arrives and sets `window.__MICKY_CONFIG__`. The root layout loads it before the app's code, and `apiUrl()` reads it on every call, falling back to the build-time value. With `output: 'standalone'`, the image only contains `server.js` and the files it actually needs.
 
 **11. How do you avoid a stale response overwriting newer data?**
 `useApi` tags each response with the request key it belongs to and ignores it if the key has changed (the effect's cleanup sets `cancelled`). Without that, quickly switching from page 1 to page 2 could show page 1's results under a "Page 2" label if the first response arrived last.

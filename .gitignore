@@ -31,15 +31,15 @@ venv/
 .pytest_cache/
 
 # Local uploads and media (never commit videos)
-uploads/
-media/
+/uploads/
+/media/
 *.mp4
 *.mov
 *.mkv
 
 # Docker volumes
-data/
-pgdata/
+/data/
+/pgdata/
 
 # Editors and OS
 .vscode/*
@@ -56,3 +56,6 @@ tmp/
 
 # Redis snapshot from a local redis-server
 dump.rdb
+
+# TypeScript incremental build info (generated on every build)
+*.tsbuildinfo

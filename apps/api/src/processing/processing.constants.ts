@@ -9,7 +9,42 @@ export const JOB = {
   processMedia: 'process-media',
   /** Repeated every few minutes: refresh trend scores of active incidents. */
   recomputeTrends: 'recompute-trends',
+  /** Make the buyer's metadata-free copy of one media: data `{ mediaId }`, job id = `delivery-<mediaId>`. */
+  prepareDelivery: 'prepare-delivery',
 } as const;
+
+/**
+ * A second queue for per-newsroom preview renditions. Separate from MEDIA_QUEUE so a
+ * newsroom opening a preview never waits behind a 10-minute upload being processed;
+ * the worker runs one job of each queue at a time (2 FFmpeg processes on 2 cores).
+ */
+export const PREVIEW_QUEUE = 'preview-render';
+
+export const PREVIEW_JOB = {
+  /** Burn one newsroom's name into one media's preview: data `{ mediaId, viewerId }`. */
+  renderViewer: 'render-viewer-preview',
+  /** Daily: delete renditions nobody opened for RENDITION_TTL_MS, and those of sold/removed media. */
+  pruneRenditions: 'prune-renditions',
+} as const;
+
+export interface RenderViewerJobData {
+  mediaId: string;
+  viewerId: string;
+}
+
+/** Cached per-newsroom renditions are deleted after this long (they are re-rendered on the next view). */
+export const RENDITION_TTL_MS = 7 * 24 * 3_600_000;
+export const PRUNE_RENDITIONS_EVERY_MS = 24 * 3_600_000;
+/** Redis sorted set: member "<mediaId>/<viewerId>", score = last render time. */
+export const RENDITIONS_INDEX_KEY = 'micky:preview-renditions';
+
+/** Render jobs are short-lived: failed or finished ones disappear quickly, so the next view can retry. */
+export const RENDER_JOB_OPTIONS: JobsOptions = {
+  attempts: 1,
+  removeOnComplete: { age: 30 },
+  removeOnFail: { age: 30 },
+  priority: 1,
+};
 
 export interface ProcessMediaJobData {
   mediaId: string;

@@ -6,7 +6,7 @@ import pg from 'pg';
 export default async function setup() {
   // globalSetup runs outside the test environment, so it computes the same URL itself.
   const url =
-    process.env.TEST_DATABASE_URL ?? 'postgresql://firstframe:firstframe@localhost:5432/firstframe_test';
+    process.env.TEST_DATABASE_URL ?? 'postgresql://micky:micky@localhost:5432/micky_test';
   const pool = new pg.Pool({ connectionString: url, max: 1 });
   try {
     await migrate(drizzle(pool), { migrationsFolder: './drizzle' });

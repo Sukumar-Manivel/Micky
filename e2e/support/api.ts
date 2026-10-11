@@ -42,7 +42,7 @@ async function ok<T>(p: Promise<{ status: number; body: T }>, expected = [200, 2
 
 /** Unique per run, so reruns against a kept database never collide. */
 export function uniqueEmail(prefix: string): string {
-  return `${prefix}-${Date.now().toString(36)}${Math.floor(Math.random() * 1e4)}@firstframe-e2e.test`;
+  return `${prefix}-${Date.now().toString(36)}${Math.floor(Math.random() * 1e4)}@micky-e2e.test`;
 }
 
 export const PASSWORD = 'correct-horse-battery-staple';

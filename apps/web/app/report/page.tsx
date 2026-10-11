@@ -11,7 +11,7 @@ export default function ReportPage() {
       <div className="flex flex-col gap-2">
         <h1 className="font-display text-5xl font-extrabold">Report content</h1>
         <p className="text-muted">
-          Are you shown in footage on FirstFrame, or is something here wrong, stolen or harmful? Tell us and a person will
+          Are you shown in footage on Micky, or is something here wrong, stolen or harmful? Tell us and a person will
           review it. You do not need an account.
         </p>
       </div>

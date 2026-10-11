@@ -1,7 +1,7 @@
 {
-  "name": "@firstframe/api",
+  "name": "@micky/api",
   "version": "0.0.1",
-  "description": "FirstFrame HTTP API and background worker",
+  "description": "Micky HTTP API and background worker",
   "author": "",
   "private": true,
   "license": "MIT",
