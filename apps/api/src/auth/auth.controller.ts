@@ -5,6 +5,7 @@ import { type AuthUser, CurrentUser, Public } from '../common/auth.decorators.js
 import { AppConfig } from '../config/app-config.js';
 import { LoginDto, RegisterDto } from './auth.dto.js';
 import { type AuthResult, AuthService } from './auth.service.js';
+import { LoginBackoffException } from './rate-limit/login-backoff.service.js';
 
 export const REFRESH_COOKIE = 'ff_refresh';
 
@@ -20,8 +21,10 @@ export class AuthController {
     private readonly config: AppConfig,
   ) {}
 
+  // Per client IP, shared across API processes in Redis. The hourly cap also slows anyone
+  // using the 409 "already exists" answer to test many emails (docs/REVIEW.md L1).
   @Public()
-  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @Throttle({ default: { limit: 10, ttl: 60_000 }, long: { limit: 30, ttl: 3_600_000 } })
   @Post('register')
   async register(@Body() dto: RegisterDto, @Res({ passthrough: true }) res: Response) {
     return this.respond(res, await this.auth.register(dto));
@@ -32,10 +35,16 @@ export class AuthController {
   @Post('login')
   @HttpCode(200)
   async login(@Body() dto: LoginDto, @Res({ passthrough: true }) res: Response) {
-    return this.respond(res, await this.auth.login(dto));
+    try {
+      return this.respond(res, await this.auth.login(dto));
+    } catch (err) {
+      if (err instanceof LoginBackoffException) res.setHeader('Retry-After', String(err.retryAfterSec));
+      throw err;
+    }
   }
 
   @Public()
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
   @Post('refresh')
   @HttpCode(200)
   async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
@@ -61,6 +70,8 @@ export class AuthController {
   }
 
   private respond(res: Response, result: AuthResult) {
+    // Note: the cookie expiry is the token's own expiry, which never passes the session's
+    // absolute end (SESSION_MAX_DAYS after login).
     res.cookie(REFRESH_COOKIE, result.refreshToken, {
       ...this.cookieOptions(),
       expires: result.refreshExpiresAt,

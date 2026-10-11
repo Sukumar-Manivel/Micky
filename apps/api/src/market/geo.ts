@@ -7,8 +7,21 @@
 //    that survived the box, and rows outside the circle are dropped.
 //
 // Both run in SQL so pagination and the total count are exact.
-import { and, between, type SQL, sql } from 'drizzle-orm';
+import { and, type SQL, sql } from 'drizzle-orm';
 import type { PgColumn } from 'drizzle-orm/pg-core';
+
+/** A column or an SQL expression (e.g. the rounded coordinate from `publicCoordinateSql`). */
+type Coordinate = PgColumn | SQL<number>;
+
+/**
+ * SQL for a coordinate rounded like the API shows it to channels
+ * (common/views.ts `publicCoordinate`). Distance filters and `distanceKm` are computed
+ * from this, not from the exact point: otherwise a few radius queries from different
+ * centres would triangulate the witness's exact position.
+ */
+export function publicCoordinateSql(column: PgColumn, decimals: number): SQL<number> {
+  return sql<number>`round(${column}::numeric, ${sql.raw(String(Math.trunc(decimals)))})::float8`;
+}
 
 /** Mean Earth radius in km (the same value `distanceKm` in common/views.ts uses). */
 const EARTH_RADIUS_KM = 6371;
@@ -46,7 +59,7 @@ export function boundingBox(lat: number, lng: number, radiusKm: number): Boundin
 }
 
 /** SQL expression: haversine distance in km from (lat, lng) to the row's columns. */
-export function distanceSql(latCol: PgColumn, lngCol: PgColumn, lat: number, lng: number): SQL<number> {
+export function distanceSql(latCol: Coordinate, lngCol: Coordinate, lat: number, lng: number): SQL<number> {
   // least(1, ...) guards against floating-point values just above 1, which asin() rejects.
   return sql<number>`(${EARTH_RADIUS_KM} * 2 * asin(least(1, sqrt(
       power(sin(radians(${latCol} - ${lat}) / 2), 2)
@@ -61,8 +74,8 @@ export function distanceSql(latCol: PgColumn, lngCol: PgColumn, lat: number, lng
  * and for returning `distanceKm` to the client.
  */
 export function withinRadius(
-  latCol: PgColumn,
-  lngCol: PgColumn,
+  latCol: Coordinate,
+  lngCol: Coordinate,
   lat: number,
   lng: number,
   radiusKm: number,
@@ -70,8 +83,10 @@ export function withinRadius(
   const box = boundingBox(lat, lng, radiusKm);
   const distance = distanceSql(latCol, lngCol, lat, lng);
   const where = and(
-    between(latCol, box.minLat, box.maxLat),
-    box.minLng !== undefined && box.maxLng !== undefined ? between(lngCol, box.minLng, box.maxLng) : undefined,
+    sql`${latCol} BETWEEN ${box.minLat} AND ${box.maxLat}`,
+    box.minLng !== undefined && box.maxLng !== undefined
+      ? sql`${lngCol} BETWEEN ${box.minLng} AND ${box.maxLng}`
+      : undefined,
     sql`${distance} <= ${radiusKm}`,
   )!;
   return { where, distance };

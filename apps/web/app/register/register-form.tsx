@@ -94,7 +94,7 @@ export function RegisterForm() {
       <Field label="Email" htmlFor="email">
         <input id="email" name="email" type="email" autoComplete="email" required className={inputClass} />
       </Field>
-      <Field label="Password" htmlFor="password" hint="At least 8 characters.">
+      <Field label="Password" htmlFor="password" hint="At least 8 characters, at most 72 (fewer in Tamil script).">
         <input
           id="password"
           name="password"
@@ -102,7 +102,8 @@ export function RegisterForm() {
           autoComplete="new-password"
           required
           minLength={8}
-          maxLength={128}
+          // The server limit is 72 bytes (bcrypt), checked there; this only stops obvious overruns.
+          maxLength={72}
           aria-describedby="password-hint"
           className={inputClass}
         />

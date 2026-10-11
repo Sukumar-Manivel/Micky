@@ -73,3 +73,40 @@ setup_rclone() {
   BACKUP_DEST="${BACKUP_DEST:-r2:$(env_get BACKUP_S3_BUCKET firstframe-backups)/postgres}"
   command -v rclone >/dev/null || die "rclone is not installed (sudo apt-get install -y rclone)"
 }
+
+# ---------- Backup encryption (age, https://age-encryption.org) ----------
+# Backups are encrypted on the server to one or more age PUBLIC keys. The matching private key
+# (identity) is kept OFF the server (password manager, laptop, printed), so neither a
+# compromised VM nor a leaked R2 token can read a backup. docs/DEPLOYMENT.md section 9.
+#
+#   BACKUP_AGE_RECIPIENTS       age1... public keys, separated by spaces or commas
+#   BACKUP_AGE_RECIPIENTS_FILE  or: a file with one public key per line
+#
+# Prints the `age` recipient arguments, one per line (read with mapfile).
+age_recipient_args() {
+  local recipients file key found=0
+  command -v age >/dev/null || die "age is not installed (sudo apt-get install -y age)"
+  recipients="$(env_get BACKUP_AGE_RECIPIENTS)"
+  file="$(env_get BACKUP_AGE_RECIPIENTS_FILE)"
+  for key in ${recipients//,/ }; do
+    [[ "$key" =~ ^age1[0-9a-z]{58}$ ]] || die "BACKUP_AGE_RECIPIENTS: not an age public key: $key"
+    printf '%s\n%s\n' -r "$key"
+    found=1
+  done
+  if [[ -n "$file" ]]; then
+    [[ -r "$file" ]] || die "BACKUP_AGE_RECIPIENTS_FILE $file is not readable"
+    printf '%s\n%s\n' -R "$file"
+    found=1
+  fi
+  [[ "$found" == 1 ]] || die "set BACKUP_AGE_RECIPIENTS (an age1... public key) in $FF_ENV_FILE: backups are never stored unencrypted"
+}
+
+# The private key used to DECRYPT a backup, for restores only. Never leave it on the server:
+# copy it up for the restore, then delete it (the restore scripts remind you).
+#   --identity FILE  or  BACKUP_AGE_IDENTITY=FILE
+age_identity_file() {
+  local file="${1:-${BACKUP_AGE_IDENTITY:-}}"
+  [[ -n "$file" ]] || die "encrypted backup: pass --identity /path/to/backup-key.txt (the age private key kept off the server)"
+  [[ -r "$file" ]] || die "cannot read the identity file $file"
+  printf '%s' "$file"
+}

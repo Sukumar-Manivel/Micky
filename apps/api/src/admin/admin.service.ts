@@ -1,10 +1,12 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { and, asc, count, eq, ne, type SQL, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, ne, type SQL, sql } from 'drizzle-orm';
+import type { AuthUser } from '../common/auth.decorators.js';
 import type { UserView } from '../auth/user-view.js';
 import { offsetOf, type Paginated, paginated } from '../common/pagination.js';
 import { UrlService } from '../common/urls.service.js';
@@ -16,17 +18,29 @@ import {
   media,
   orders,
   payouts,
+  refunds,
   reports,
+  uploaderProfiles,
   users,
   verifications,
 } from '../db/schema.js';
-import { type PayoutView, toPayoutView } from '../earnings/earnings-views.js';
+import {
+  type LedgerEntryView,
+  type PayoutView,
+  toLedgerEntryView,
+  toPayoutView,
+} from '../earnings/earnings-views.js';
+import { type OrderView, toOrderView } from '../orders/order-view.js';
+import { RefundsService } from '../orders/refunds.service.js';
 import { IncidentsService } from '../incidents/incidents.service.js';
 import { RealtimeService } from '../realtime/realtime.service.js';
 import { type ReportView, toReportView } from '../reports/report-view.js';
 import type {
+  LedgerAdjustmentDto,
   ListChannelsQuery,
+  ListOrdersAdminQuery,
   ListPayoutsQuery,
+  ListRefundsQuery,
   ListReportsQuery,
   ResolveReportDto,
   ReviewQueueQuery,
@@ -49,10 +63,60 @@ export interface AdminStats {
     approved: number;
     rejected: number;
   };
-  orders: { paid: number; revenue: number; platformFees: number };
+  orders: {
+    paid: number;
+    revenue: number;
+    platformFees: number;
+    disputed: number;
+  };
+  refunds: { pending: number; failed: number };
   payouts: { requested: number; requestedAmount: number };
   reports: { open: number };
 }
+
+export interface BuyerRef {
+  id: string;
+  email: string;
+  organization: string | null;
+}
+
+/** A refund for the admin's refund queue. */
+export interface AdminRefundView {
+  id: string;
+  status: 'PENDING' | 'PROCESSED' | 'FAILED';
+  amount: number;
+  reason: string;
+  providerPaymentId: string;
+  providerRefundId: string | null;
+  attempts: number;
+  lastError: string | null;
+  createdAt: string;
+  processedAt: string | null;
+  order: {
+    id: string;
+    status: OrderView['status'];
+    licenseType: OrderView['licenseType'];
+  };
+  media: { id: string; title: string };
+  buyer: BuyerRef;
+}
+
+export type AdminOrderView = OrderView & {
+  providerPaymentId: string | null;
+  buyer: BuyerRef;
+};
+
+/** A payout with what the admin needs to judge it, including a recent UPI change (review M4). */
+export type AdminPayoutView = PayoutView & {
+  uploader: UploaderRef;
+  /** When the uploader last changed their UPI ID (null if never). */
+  upiChangedAt: string | null;
+  /** The UPI ID was changed within 7 days before this payout was requested. */
+  upiChangedRecently: boolean;
+};
+
+/** "Recently" for the admin's warning: wider than the cooling-off, to make a person look twice. */
+const UPI_CHANGE_FLAG_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** `count(*) filter (where ...)` as a number: several counts in one table scan. */
 const countWhere = (condition: SQL) =>
@@ -73,6 +137,7 @@ export class AdminService {
     private readonly urls: UrlService,
     private readonly incidents: IncidentsService,
     private readonly realtime: RealtimeService,
+    private readonly refundsService: RefundsService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -80,7 +145,7 @@ export class AdminService {
   // ---------------------------------------------------------------------------
 
   async stats(): Promise<AdminStats> {
-    const [[u], [m], [o], [p], [r]] = await Promise.all([
+    const [[u], [m], [o], [p], [r], [d], [f]] = await Promise.all([
       this.db
         .select({
           uploaders: countWhere(sql`${users.role} = 'UPLOADER'`),
@@ -124,8 +189,25 @@ export class AdminService {
         .select({ open: count() })
         .from(reports)
         .where(eq(reports.status, 'OPEN')),
+      this.db
+        .select({ disputed: count() })
+        .from(orders)
+        .where(eq(orders.status, 'DISPUTED')),
+      this.db
+        .select({
+          pending: countWhere(sql`${refunds.status} = 'PENDING'`),
+          failed: countWhere(sql`${refunds.status} = 'FAILED'`),
+        })
+        .from(refunds),
     ]);
-    return { users: u, media: m, orders: o, payouts: p, reports: r };
+    return {
+      users: u,
+      media: m,
+      orders: { ...o, disputed: d.disputed },
+      refunds: f,
+      payouts: p,
+      reports: r,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -339,16 +421,21 @@ export class AdminService {
 
   async listPayouts(
     query: ListPayoutsQuery,
-  ): Promise<Paginated<PayoutView & { uploader: UploaderRef }>> {
+  ): Promise<Paginated<AdminPayoutView>> {
     const where = query.status ? eq(payouts.status, query.status) : undefined;
     const [rows, [{ total }]] = await Promise.all([
       this.db
         .select({
           payout: payouts,
           uploader: { id: users.id, name: users.name, email: users.email },
+          upiChangedAt: uploaderProfiles.upiChangedAt,
         })
         .from(payouts)
         .innerJoin(users, eq(users.id, payouts.uploaderId))
+        .leftJoin(
+          uploaderProfiles,
+          eq(uploaderProfiles.userId, payouts.uploaderId),
+        )
         .where(where)
         // Oldest first: requests are paid in the order they were made.
         .orderBy(asc(payouts.createdAt), asc(payouts.id))
@@ -357,7 +444,15 @@ export class AdminService {
       this.db.select({ total: count() }).from(payouts).where(where),
     ]);
     return paginated(
-      rows.map((r) => ({ ...toPayoutView(r.payout), uploader: r.uploader })),
+      rows.map((r) => ({
+        ...toPayoutView(r.payout),
+        uploader: r.uploader,
+        upiChangedAt: r.upiChangedAt?.toISOString() ?? null,
+        upiChangedRecently:
+          r.upiChangedAt !== null &&
+          r.upiChangedAt.getTime() >
+            r.payout.createdAt.getTime() - UPI_CHANGE_FLAG_MS,
+      })),
       total,
       query,
     );
@@ -414,6 +509,159 @@ export class AdminService {
     throw new ConflictException(
       `This payout has already been processed (${current.status})`,
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Refunds, disputes and ledger adjustments (review H1, H2)
+  // ---------------------------------------------------------------------------
+
+  /** Refunds, oldest first (the longest-waiting buyer comes first). */
+  async listRefunds(
+    query: ListRefundsQuery,
+  ): Promise<Paginated<AdminRefundView>> {
+    const where = query.status ? eq(refunds.status, query.status) : undefined;
+    const [rows, [{ total }]] = await Promise.all([
+      this.db
+        .select({
+          refund: refunds,
+          order: {
+            id: orders.id,
+            status: orders.status,
+            licenseType: orders.licenseType,
+          },
+          media: { id: media.id, title: media.title },
+          buyer: {
+            id: users.id,
+            email: users.email,
+            organization: channelProfiles.organization,
+          },
+        })
+        .from(refunds)
+        .innerJoin(orders, eq(orders.id, refunds.orderId))
+        .innerJoin(media, eq(media.id, orders.mediaId))
+        .innerJoin(users, eq(users.id, orders.buyerId))
+        .leftJoin(channelProfiles, eq(channelProfiles.userId, orders.buyerId))
+        .where(where)
+        .orderBy(asc(refunds.createdAt), asc(refunds.id))
+        .limit(query.pageSize)
+        .offset(offsetOf(query)),
+      this.db.select({ total: count() }).from(refunds).where(where),
+    ]);
+    return paginated(
+      rows.map((r) => ({
+        id: r.refund.id,
+        status: r.refund.status,
+        amount: r.refund.amount,
+        reason: r.refund.reason,
+        providerPaymentId: r.refund.providerPaymentId,
+        providerRefundId: r.refund.providerRefundId,
+        attempts: r.refund.attempts,
+        lastError: r.refund.lastError,
+        createdAt: r.refund.createdAt.toISOString(),
+        processedAt: r.refund.processedAt?.toISOString() ?? null,
+        order: r.order,
+        media: r.media,
+        buyer: r.buyer,
+      })),
+      total,
+      query,
+    );
+  }
+
+  /** Manual retry of a FAILED (or stuck PENDING) refund. 409 if already processed. */
+  async retryRefund(
+    refundId: string,
+  ): Promise<{ id: string; status: 'PENDING' }> {
+    const row = await this.refundsService.retry(refundId);
+    return { id: row.id, status: 'PENDING' };
+  }
+
+  /** Orders by status, newest first, e.g. DISPUTED or REFUND_PENDING. */
+  async listOrders(
+    query: ListOrdersAdminQuery,
+  ): Promise<Paginated<AdminOrderView>> {
+    const where = query.status ? eq(orders.status, query.status) : undefined;
+    const [rows, [{ total }]] = await Promise.all([
+      this.db
+        .select({
+          order: orders,
+          media: {
+            id: media.id,
+            title: media.title,
+            type: media.type,
+            thumbKey: media.thumbKey,
+          },
+          buyer: {
+            id: users.id,
+            email: users.email,
+            organization: channelProfiles.organization,
+          },
+        })
+        .from(orders)
+        .innerJoin(media, eq(media.id, orders.mediaId))
+        .innerJoin(users, eq(users.id, orders.buyerId))
+        .leftJoin(channelProfiles, eq(channelProfiles.userId, orders.buyerId))
+        .where(where)
+        .orderBy(desc(orders.createdAt), desc(orders.id))
+        .limit(query.pageSize)
+        .offset(offsetOf(query)),
+      this.db.select({ total: count() }).from(orders).where(where),
+    ]);
+    return paginated(
+      rows.map((r) => ({
+        ...toOrderView(r.order, r.media, this.urls),
+        providerPaymentId: r.order.providerPaymentId,
+        buyer: r.buyer,
+      })),
+      total,
+      query,
+    );
+  }
+
+  /**
+   * POST /admin/ledger-adjustments: a manual ADJUSTMENT row (+ or −) with a mandatory
+   * note and the admin's id. The ledger is append-only, so this is the only way to
+   * correct a balance. The same advisory lock as payouts keeps a debit from racing a
+   * payout request.
+   */
+  async createAdjustment(
+    admin: AuthUser,
+    dto: LedgerAdjustmentDto,
+  ): Promise<LedgerEntryView & { uploaderId: string }> {
+    if ((dto.uploaderId === undefined) === (dto.uploaderEmail === undefined)) {
+      throw new BadRequestException(
+        'Give exactly one of uploaderId or uploaderEmail',
+      );
+    }
+    const uploader = await this.db.query.users.findFirst({
+      where: dto.uploaderId
+        ? eq(users.id, dto.uploaderId)
+        : eq(sql`lower(${users.email})`, dto.uploaderEmail!.toLowerCase()),
+      columns: { id: true, role: true },
+    });
+    if (!uploader || uploader.role !== 'UPLOADER')
+      throw new NotFoundException('Uploader not found');
+
+    const entry = await this.db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtext(${uploader.id}))`,
+      );
+      const [row] = await tx
+        .insert(ledgerEntries)
+        .values({
+          uploaderId: uploader.id,
+          type: 'ADJUSTMENT',
+          amount: dto.amount,
+          note: dto.note,
+          createdBy: admin.id,
+        })
+        .returning();
+      return row;
+    });
+    this.logger.warn(
+      `Ledger ADJUSTMENT of ${dto.amount} paise for uploader ${uploader.id} by admin ${admin.id}: ${dto.note}`,
+    );
+    return { ...toLedgerEntryView(entry, null), uploaderId: uploader.id };
   }
 
   // ---------------------------------------------------------------------------

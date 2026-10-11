@@ -1,14 +1,24 @@
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { eq, sql } from 'drizzle-orm';
 import request from 'supertest';
-import { ledgerEntries, payouts } from '../src/db/schema.js';
+import {
+  ledgerEntries,
+  orders,
+  payoutDetailChanges,
+  payouts,
+  uploaderProfiles,
+} from '../src/db/schema.js';
+import { OrdersService } from '../src/orders/orders.service.js';
 import { auth, createAdmin, db, resetDb, startApp } from './helpers.js';
 import {
   buy,
   clearRateLimits,
   createApprovedChannel,
   createUploader,
+  drainCommerceQueue,
   insertMedia,
+  releaseHeldCredits,
+  setUpi,
 } from './orders.fixtures.js';
 
 describe('Earnings (e2e)', () => {
@@ -18,6 +28,7 @@ describe('Earnings (e2e)', () => {
   beforeAll(async () => {
     app = await startApp();
     server = app.getHttpServer();
+    await drainCommerceQueue(app);
   });
   beforeEach(async () => {
     await resetDb(app);
@@ -27,8 +38,11 @@ describe('Earnings (e2e)', () => {
     await app.close();
   });
 
-  /** An uploader with a UPI ID and two sales: ₹1,500 non-exclusive (₹1,050 share) and ₹2,000 exclusive photo (₹1,400). */
-  async function uploaderWithSales() {
+  /**
+   * An uploader with a UPI ID and two sales: ₹1,500 non-exclusive (₹1,050 share) and
+   * ₹2,000 exclusive photo (₹1,400). With `released`, the 7-day hold has ended.
+   */
+  async function uploaderWithSales({ released = true } = {}) {
     const uploader = await createUploader(app);
     const channel = await createApprovedChannel(app, 'Kovai News');
     const video = await insertMedia(app, uploader.user.id);
@@ -38,14 +52,16 @@ describe('Earnings (e2e)', () => {
       priceNonExclusive: 500_00,
       priceExclusive: 2_000_00,
     });
-    await buy(app, channel.accessToken, video.id, 'NON_EXCLUSIVE');
+    const videoOrder = await buy(
+      app,
+      channel.accessToken,
+      video.id,
+      'NON_EXCLUSIVE',
+    );
     await buy(app, channel.accessToken, photo.id, 'EXCLUSIVE');
-    await request(server)
-      .put('/api/v1/me/payout-details')
-      .set(auth(uploader.accessToken))
-      .send({ upiId: 'priya.k-92@okaxis' })
-      .expect(200);
-    return { uploader, channel, video, photo };
+    await setUpi(app, uploader, 'priya.k-92@okaxis').expect(200);
+    if (released) await releaseHeldCredits(app, uploader.user.id);
+    return { uploader, channel, video, photo, videoOrder };
   }
 
   const requestPayout = (token: string, amount: number) =>
@@ -75,12 +91,99 @@ describe('Earnings (e2e)', () => {
       const res = await request(server)
         .put('/api/v1/me/payout-details')
         .set(auth(uploader.accessToken))
-        .send({ upiId: '  9876543210@ybl ' })
+        .send({
+          upiId: '  9876543210@ybl ',
+          currentPassword: uploader.password,
+        })
         .expect(200);
       expect(res.body.user).toMatchObject({
         id: uploader.user.id,
         uploader: { upiId: '9876543210@ybl' },
       });
+      // The first UPI ID has no cooling-off: there was nowhere else for money to go.
+      expect(res.body.payoutDetails).toEqual({
+        upiId: '9876543210@ybl',
+        changedAt: null,
+        payoutsAllowedFrom: null,
+      });
+    });
+
+    it('requires the current password (M4)', async () => {
+      const uploader = await createUploader(app);
+      await request(server)
+        .put('/api/v1/me/payout-details')
+        .set(auth(uploader.accessToken))
+        .send({ upiId: 'thief@okaxis' })
+        .expect(400);
+      const wrong = await request(server)
+        .put('/api/v1/me/payout-details')
+        .set(auth(uploader.accessToken))
+        .send({ upiId: 'thief@okaxis', currentPassword: 'not-my-password' })
+        .expect(403);
+      expect(wrong.body.message).toMatch(/password/);
+      const [profile] = await db(app)
+        .select()
+        .from(uploaderProfiles)
+        .where(eq(uploaderProfiles.userId, uploader.user.id));
+      expect(profile.upiId).toBeNull();
+      expect(await db(app).select().from(payoutDetailChanges)).toHaveLength(0);
+    });
+
+    it('a change starts a 24-hour cooling-off before any payout, and is audited (M4)', async () => {
+      const { uploader } = await uploaderWithSales();
+      // Payouts to the original ID work.
+      await requestPayout(uploader.accessToken, 100_00).expect(201);
+
+      const changed = await request(server)
+        .put('/api/v1/me/payout-details')
+        .set(auth(uploader.accessToken))
+        .set('User-Agent', 'e2e-agent')
+        .send({ upiId: 'new.id@oksbi', currentPassword: uploader.password })
+        .expect(200);
+      const allowedFrom = new Date(
+        changed.body.payoutDetails.payoutsAllowedFrom,
+      ).getTime();
+      expect(allowedFrom - Date.now()).toBeGreaterThan(23.9 * 3600_000);
+      expect(allowedFrom - Date.now()).toBeLessThanOrEqual(24 * 3600_000);
+
+      const blocked = await requestPayout(uploader.accessToken, 100_00).expect(
+        400,
+      );
+      expect(blocked.body.message).toMatch(/UPI ID was changed recently/);
+      const summary = await request(server)
+        .get('/api/v1/me/earnings')
+        .set(auth(uploader.accessToken))
+        .expect(200);
+      expect(summary.body.payoutDetails).toMatchObject({
+        upiId: 'new.id@oksbi',
+        payoutsAllowedFrom: changed.body.payoutDetails.payoutsAllowedFrom,
+      });
+
+      const audit = await db(app)
+        .select()
+        .from(payoutDetailChanges)
+        .where(eq(payoutDetailChanges.userId, uploader.user.id));
+      expect(audit.map((a) => [a.oldUpiId, a.newUpiId])).toEqual(
+        expect.arrayContaining([
+          [null, 'priya.k-92@okaxis'],
+          ['priya.k-92@okaxis', 'new.id@oksbi'],
+        ]),
+      );
+      expect(audit.find((a) => a.newUpiId === 'new.id@oksbi')?.userAgent).toBe(
+        'e2e-agent',
+      );
+
+      // Saving the same ID again is not a change and does not restart the clock.
+      await setUpi(app, uploader, 'new.id@oksbi').expect(200);
+      expect(await db(app).select().from(payoutDetailChanges)).toHaveLength(2);
+
+      // After 24 hours, payouts work again (to the new ID).
+      await db(app)
+        .update(uploaderProfiles)
+        .set({ upiChangedAt: new Date(Date.now() - 24 * 3600_000 - 1000) })
+        .where(eq(uploaderProfiles.userId, uploader.user.id));
+      const ok = await requestPayout(uploader.accessToken, 100_00).expect(201);
+      expect(ok.body.upiId).toBe('new.id@oksbi');
     });
 
     it('rejects malformed UPI IDs', async () => {
@@ -97,7 +200,7 @@ describe('Earnings (e2e)', () => {
         await request(server)
           .put('/api/v1/me/payout-details')
           .set(auth(uploader.accessToken))
-          .send({ upiId })
+          .send({ upiId, currentPassword: uploader.password })
           .expect(400);
       }
     });
@@ -112,6 +215,10 @@ describe('Earnings (e2e)', () => {
         .expect(200);
       expect(res.body).toMatchObject({
         balance: 2_450_00,
+        available: 2_450_00,
+        onHold: 0,
+        nextReleaseAt: null,
+        holdDays: 7,
         totalEarned: 2_450_00,
         totalPaidOut: 0,
         pendingPayouts: 0,
@@ -133,10 +240,19 @@ describe('Earnings (e2e)', () => {
         .expect(200);
       expect(res.body).toEqual({
         balance: 0,
+        available: 0,
+        onHold: 0,
+        nextReleaseAt: null,
+        holdDays: 7,
         totalEarned: 0,
         totalPaidOut: 0,
         pendingPayouts: 0,
         salesCount: 0,
+        payoutDetails: {
+          upiId: null,
+          changedAt: null,
+          payoutsAllowedFrom: null,
+        },
         recent: [],
       });
     });
@@ -176,6 +292,7 @@ describe('Earnings (e2e)', () => {
         amount: 2_000_00,
         uploaderShare: 1_400_00,
         buyerOrganization: 'Kovai News',
+        status: 'PAID',
       });
       expect(res.body.items[0].paidAt).toBeTruthy();
 
@@ -231,7 +348,9 @@ describe('Earnings (e2e)', () => {
       let res = await requestPayout(uploader.accessToken, 99_99).expect(400);
       expect(res.body.message).toMatch(/minimum payout is ₹100\.00/);
       res = await requestPayout(uploader.accessToken, 2_450_01).expect(400);
-      expect(res.body.message).toMatch(/at most your balance of ₹2450\.00/);
+      expect(res.body.message).toMatch(
+        /at most your available balance of ₹2450\.00/,
+      );
       await requestPayout(uploader.accessToken, 100.5).expect(400);
       await request(server)
         .post('/api/v1/me/payouts')
@@ -243,13 +362,12 @@ describe('Earnings (e2e)', () => {
       await requestPayout(uploader.accessToken, 2_450_00).expect(201);
 
       const noUpi = await createUploader(app);
-      await db(app)
-        .insert(ledgerEntries)
-        .values({
-          uploaderId: noUpi.user.id,
-          type: 'ADJUSTMENT',
-          amount: 500_00,
-        });
+      await db(app).insert(ledgerEntries).values({
+        uploaderId: noUpi.user.id,
+        type: 'ADJUSTMENT',
+        amount: 500_00,
+        note: 'Test opening balance',
+      });
       res = await requestPayout(noUpi.accessToken, 200_00).expect(400);
       expect(res.body.message).toMatch(/UPI ID/);
     });
@@ -274,6 +392,144 @@ describe('Earnings (e2e)', () => {
         .where(eq(ledgerEntries.uploaderId, uploader.user.id));
       expect(balance).toBe(50_00);
       expect(await db(app).select().from(payouts)).toHaveLength(3);
+    });
+  });
+  describe('hold period, reversals and the append-only ledger (H2, L6)', () => {
+    it('sale credits are on hold for 7 days: no payout until the hold ends', async () => {
+      const { uploader } = await uploaderWithSales({ released: false });
+      const summary = await request(server)
+        .get('/api/v1/me/earnings')
+        .set(auth(uploader.accessToken))
+        .expect(200);
+      expect(summary.body).toMatchObject({
+        balance: 2_450_00,
+        available: 0,
+        onHold: 2_450_00,
+        totalEarned: 2_450_00,
+      });
+      const release =
+        new Date(summary.body.nextReleaseAt).getTime() - Date.now();
+      expect(release).toBeGreaterThan(6.9 * 24 * 3600_000);
+      // The oldest sale is released first.
+      expect(summary.body.recent.at(-1).availableAt).toBe(
+        summary.body.nextReleaseAt,
+      );
+
+      const blocked = await requestPayout(uploader.accessToken, 100_00).expect(
+        400,
+      );
+      expect(blocked.body.message).toMatch(/available balance of ₹0\.00/);
+      expect(blocked.body.message).toMatch(/₹2450\.00 more is on hold/);
+      expect(await db(app).select().from(payouts)).toHaveLength(0);
+
+      // Seven days later...
+      await releaseHeldCredits(app, uploader.user.id);
+      await requestPayout(uploader.accessToken, 2_450_00).expect(201);
+    });
+
+    it('a refund after the money was paid out leaves a negative balance that blocks payouts', async () => {
+      const { uploader, videoOrder } = await uploaderWithSales();
+      await requestPayout(uploader.accessToken, 2_450_00).expect(201);
+
+      const [order] = await db(app)
+        .select()
+        .from(orders)
+        .where(eq(orders.id, videoOrder.id));
+      const result = await app
+        .get(OrdersService)
+        .reverseSaleForRefund(
+          order.providerPaymentId!,
+          'Refunded in the dashboard',
+        );
+      expect(result).toBe('reversed');
+
+      const summary = await request(server)
+        .get('/api/v1/me/earnings')
+        .set(auth(uploader.accessToken))
+        .expect(200);
+      expect(summary.body).toMatchObject({
+        balance: -1_050_00,
+        available: -1_050_00,
+        totalEarned: 1_400_00,
+        salesCount: 1,
+      });
+      expect(summary.body.recent[0]).toMatchObject({
+        type: 'SALE_REVERSAL',
+        amount: -1_050_00,
+        mediaTitle: 'Fire near Gandhipuram',
+      });
+      await requestPayout(uploader.accessToken, 100_00).expect(400);
+
+      const sales = await request(server)
+        .get('/api/v1/me/sales')
+        .set(auth(uploader.accessToken))
+        .expect(200);
+      expect(
+        sales.body.items.map((x: { status: string }) => x.status).sort(),
+      ).toEqual(['PAID', 'REFUNDED']);
+    });
+
+    it('a refund inside the hold period cancels the held credit without touching the available balance', async () => {
+      const { uploader, videoOrder } = await uploaderWithSales({
+        released: false,
+      });
+      const [order] = await db(app)
+        .select()
+        .from(orders)
+        .where(eq(orders.id, videoOrder.id));
+      await app
+        .get(OrdersService)
+        .reverseSaleForRefund(order.providerPaymentId!, 'Refunded');
+      const summary = await request(server)
+        .get('/api/v1/me/earnings')
+        .set(auth(uploader.accessToken))
+        .expect(200);
+      expect(summary.body).toMatchObject({
+        balance: 1_400_00,
+        available: 0,
+        onHold: 1_400_00,
+      });
+    });
+
+    it('the ledger is append-only and money rows are checked by the database', async () => {
+      const { uploader } = await uploaderWithSales();
+      await expect(
+        db(app)
+          .update(ledgerEntries)
+          .set({ amount: 1 })
+          .where(eq(ledgerEntries.uploaderId, uploader.user.id)),
+      ).rejects.toMatchObject({
+        cause: { message: expect.stringMatching(/append-only/) },
+      });
+      await expect(
+        db(app)
+          .delete(ledgerEntries)
+          .where(eq(ledgerEntries.uploaderId, uploader.user.id)),
+      ).rejects.toMatchObject({
+        cause: { message: expect.stringMatching(/append-only/) },
+      });
+      // A positive payout debit, an adjustment without a note, a zero amount: all refused.
+      for (const values of [
+        { type: 'PAYOUT_DEBIT' as const, amount: 100 },
+        { type: 'ADJUSTMENT' as const, amount: 100 },
+        { type: 'ADJUSTMENT' as const, amount: 0, note: 'zero' },
+        { type: 'SALE_CREDIT' as const, amount: 100 },
+      ]) {
+        await expect(
+          db(app)
+            .insert(ledgerEntries)
+            .values({ uploaderId: uploader.user.id, ...values }),
+        ).rejects.toMatchObject({ cause: { code: '23514' } });
+      }
+      await expect(
+        db(app)
+          .insert(payouts)
+          .values({
+            uploaderId: uploader.user.id,
+            amount: 0,
+            upiId: 'x@okaxis',
+          }),
+      ).rejects.toMatchObject({ cause: { code: '23514' } });
     });
   });
 });

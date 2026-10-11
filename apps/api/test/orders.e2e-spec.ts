@@ -6,7 +6,14 @@ import {
   ledgerEntries,
   media,
   orders,
+  refunds,
 } from '../src/db/schema.js';
+import { OrdersService } from '../src/orders/orders.service.js';
+import {
+  PAYMENT_PROVIDER,
+  type PaymentProvider,
+} from '../src/orders/payments/payment-provider.js';
+import { RefundsService } from '../src/orders/refunds.service.js';
 import {
   auth,
   createAdmin,
@@ -20,8 +27,10 @@ import {
   clearRateLimits,
   createApprovedChannel,
   createUploader,
+  drainCommerceQueue,
   insertMedia,
   type MediaRow,
+  waitForOrderStatus,
 } from './orders.fixtures.js';
 
 // Runs with PAYMENTS_PROVIDER=mock (vitest.config.e2e.ts). The Razorpay paths
@@ -33,6 +42,7 @@ describe('Orders (e2e, mock provider)', () => {
   beforeAll(async () => {
     app = await startApp();
     server = app.getHttpServer();
+    await drainCommerceQueue(app);
   });
   beforeEach(async () => {
     await resetDb(app);
@@ -55,6 +65,12 @@ describe('Orders (e2e, mock provider)', () => {
       .from(ledgerEntries)
       .where(eq(ledgerEntries.orderId, orderId));
 
+  const refundsFor = (orderId: string) =>
+    db(app).select().from(refunds).where(eq(refunds.orderId, orderId));
+
+  const orderRow = async (orderId: string) =>
+    (await db(app).select().from(orders).where(eq(orders.id, orderId)))[0];
+
   describe('POST /orders', () => {
     it('creates a checkout with the right amount and a 30% platform fee split', async () => {
       const { channel, item } = await setup();
@@ -69,9 +85,14 @@ describe('Orders (e2e, mock provider)', () => {
         amount: 1_500_00,
         currency: 'INR',
         provider: 'mock',
+        expiresAt: expect.any(String),
         description: 'Non-exclusive licence: Fire near Gandhipuram',
       });
       expect(res.body).not.toHaveProperty('razorpay');
+      // The checkout (and its price) is valid for 30 minutes.
+      const ttl = new Date(res.body.expiresAt).getTime() - Date.now();
+      expect(ttl).toBeGreaterThan(29 * 60 * 1000);
+      expect(ttl).toBeLessThanOrEqual(30 * 60 * 1000);
 
       const [row] = await db(app)
         .select()
@@ -113,7 +134,7 @@ describe('Orders (e2e, mock provider)', () => {
       expect(c.body.orderId).not.toBe(a.body.orderId);
     });
 
-    it('does not reuse a checkout older than 30 minutes', async () => {
+    it('does not reuse a checkout with less than 10 minutes left to pay', async () => {
       const { channel, item } = await setup();
       const body = { mediaId: item.id, licenseType: 'NON_EXCLUSIVE' };
       const a = await request(server)
@@ -123,7 +144,7 @@ describe('Orders (e2e, mock provider)', () => {
         .expect(201);
       await db(app)
         .update(orders)
-        .set({ createdAt: new Date(Date.now() - 31 * 60 * 1000) })
+        .set({ expiresAt: new Date(Date.now() + 9 * 60 * 1000) })
         .where(eq(orders.id, a.body.orderId));
       const b = await request(server)
         .post('/api/v1/orders')
@@ -259,19 +280,29 @@ describe('Orders (e2e, mock provider)', () => {
         .expect(201);
       // ...then the exclusive licence is sold to someone else...
       await buy(app, channel.accessToken, item.id, 'EXCLUSIVE');
-      // ...so the old checkout must fail instead of granting a second licence.
+      // ...so the old checkout must not grant a second licence: the money goes back.
       const res = await request(server)
         .post(`/api/v1/orders/${slow.body.orderId}/mock-pay`)
         .set(auth(other.accessToken))
         .expect(409);
-      expect(res.body.message).toMatch(/refunded/);
+      expect(res.body.message).toMatch(/licensed exclusively/);
+      expect(res.body.message).toMatch(
+        /full refund of your payment has been requested/,
+      );
+      expect(res.body.message).not.toMatch(/automatic/i);
 
-      const [row] = await db(app)
-        .select()
-        .from(orders)
-        .where(eq(orders.id, slow.body.orderId));
-      expect(row.status).toBe('FAILED');
+      await waitForOrderStatus(app, slow.body.orderId, 'REFUNDED');
+      const row = await orderRow(slow.body.orderId);
+      expect(row.statusReason).toMatch(/licensed exclusively/);
+      expect(row.refundedAt).toBeTruthy();
       expect(await ledgerFor(row.id)).toHaveLength(0);
+      const [refund] = await refundsFor(row.id);
+      expect(refund).toMatchObject({
+        status: 'PROCESSED',
+        amount: row.amount,
+        providerPaymentId: row.providerPaymentId,
+      });
+      expect(refund.providerRefundId).toMatch(/^mock_rfnd_/);
     });
   });
 
@@ -337,7 +368,7 @@ describe('Orders (e2e, mock provider)', () => {
       expect(await ledgerFor(checkout.body.orderId)).toHaveLength(1);
     });
 
-    it('two channels racing for the same exclusive licence: exactly one wins', async () => {
+    it('two channels racing for the same exclusive licence: exactly one wins, the losers are refunded', async () => {
       const { uploader, item } = await setup();
       const channels = await Promise.all([
         createApprovedChannel(app, 'Channel A'),
@@ -371,7 +402,23 @@ describe('Orders (e2e, mock provider)', () => {
         .from(orders)
         .where(eq(orders.mediaId, item.id));
       expect(all.filter((o) => o.status === 'PAID')).toHaveLength(1);
-      expect(all.filter((o) => o.status === 'FAILED')).toHaveLength(2);
+      const losers = all.filter((o) => o.status !== 'PAID');
+      expect(losers).toHaveLength(2);
+      for (const p of payments.filter((r) => r.status === 409))
+        expect(p.body.message).toMatch(/full refund/);
+
+      // Each loser's captured payment is refunded by the background job (review H1).
+      for (const loser of losers) {
+        expect(loser.providerPaymentId).toBeTruthy();
+        await waitForOrderStatus(app, loser.id, 'REFUNDED');
+        const loserRefunds = await refundsFor(loser.id);
+        expect(loserRefunds).toHaveLength(1);
+        expect(loserRefunds[0]).toMatchObject({
+          status: 'PROCESSED',
+          amount: 5_000_00,
+          providerPaymentId: loser.providerPaymentId,
+        });
+      }
 
       const credits = await db(app)
         .select()
@@ -415,6 +462,220 @@ describe('Orders (e2e, mock provider)', () => {
           razorpaySignature: 'a'.repeat(64),
         })
         .expect(400);
+    });
+  });
+
+  describe('refunds, expiry and the hold period', () => {
+    it('credits the uploader with a share that is held for 7 days', async () => {
+      const { channel, item } = await setup();
+      const order = await buy(app, channel.accessToken, item.id);
+      const [credit] = await ledgerFor(order.id);
+      const held = credit.availableAt.getTime() - Date.now();
+      expect(held).toBeGreaterThan(7 * 24 * 3600_000 - 60_000);
+      expect(held).toBeLessThanOrEqual(7 * 24 * 3600_000);
+    });
+
+    it('a payment for an expired checkout is refunded instead of granting the licence', async () => {
+      const { channel, item } = await setup();
+      const checkout = await request(server)
+        .post('/api/v1/orders')
+        .set(auth(channel.accessToken))
+        .send({ mediaId: item.id, licenseType: 'NON_EXCLUSIVE' })
+        .expect(201);
+      // The buyer comes back after the 30-minute window (and the uploader may have raised the price).
+      await db(app)
+        .update(orders)
+        .set({ expiresAt: new Date(Date.now() - 60_000) })
+        .where(eq(orders.id, checkout.body.orderId));
+      await db(app)
+        .update(media)
+        .set({ priceNonExclusive: 2_500_00 })
+        .where(eq(media.id, item.id));
+
+      const res = await request(server)
+        .post(`/api/v1/orders/${checkout.body.orderId}/mock-pay`)
+        .set(auth(channel.accessToken))
+        .expect(409);
+      expect(res.body.message).toMatch(/expired/);
+
+      await waitForOrderStatus(app, checkout.body.orderId, 'REFUNDED');
+      expect(await ledgerFor(checkout.body.orderId)).toHaveLength(0);
+      expect((await refundsFor(checkout.body.orderId))[0]).toMatchObject({
+        status: 'PROCESSED',
+        amount: 1_500_00,
+      });
+      // A new checkout quotes the new price.
+      const fresh = await request(server)
+        .post('/api/v1/orders')
+        .set(auth(channel.accessToken))
+        .send({ mediaId: item.id, licenseType: 'NON_EXCLUSIVE' })
+        .expect(201);
+      expect(fresh.body.amount).toBe(2_500_00);
+    });
+
+    it('housekeeping expires unpaid checkouts after their window, and only those', async () => {
+      const { channel, item } = await setup();
+      const stale = await request(server)
+        .post('/api/v1/orders')
+        .set(auth(channel.accessToken))
+        .send({ mediaId: item.id, licenseType: 'NON_EXCLUSIVE' })
+        .expect(201);
+      const open = await request(server)
+        .post('/api/v1/orders')
+        .set(auth(channel.accessToken))
+        .send({ mediaId: item.id, licenseType: 'EXCLUSIVE' })
+        .expect(201);
+      await db(app)
+        .update(orders)
+        .set({ expiresAt: new Date(Date.now() - 10 * 60_000) })
+        .where(eq(orders.id, stale.body.orderId));
+
+      expect(await app.get(OrdersService).expireStaleCheckouts()).toBe(1);
+      expect((await orderRow(stale.body.orderId)).status).toBe('EXPIRED');
+      expect((await orderRow(open.body.orderId)).status).toBe('CREATED');
+
+      // An EXPIRED checkout cannot be paid either: the money is refunded.
+      await request(server)
+        .post(`/api/v1/orders/${stale.body.orderId}/mock-pay`)
+        .set(auth(channel.accessToken))
+        .expect(409);
+      await waitForOrderStatus(app, stale.body.orderId, 'REFUNDED');
+    });
+
+    it('a second payment for an already paid order is refunded; the order stays PAID', async () => {
+      const { channel, item } = await setup();
+      const order = await buy(app, channel.accessToken, item.id);
+      const result = await app
+        .get(OrdersService)
+        .markPaid(order.id, { id: 'mock_pay_duplicate', paidAt: new Date() });
+      expect(result.outcome).toBe('already_paid');
+
+      await expect
+        .poll(async () => (await refundsFor(order.id))[0]?.status, {
+          timeout: 10_000,
+        })
+        .toBe('PROCESSED');
+      const row = await orderRow(order.id);
+      expect(row.status).toBe('PAID');
+      expect(row.providerPaymentId).not.toBe('mock_pay_duplicate');
+      expect((await refundsFor(order.id))[0].providerPaymentId).toBe(
+        'mock_pay_duplicate',
+      );
+      expect(await ledgerFor(order.id)).toHaveLength(1); // still exactly one credit
+    });
+
+    it('a refund that keeps failing ends REFUND_FAILED and keeps the error for the admin', async () => {
+      const { channel, item } = await setup();
+      const other = await createApprovedChannel(app, 'Other News');
+      const slow = await request(server)
+        .post('/api/v1/orders')
+        .set(auth(other.accessToken))
+        .send({ mediaId: item.id, licenseType: 'NON_EXCLUSIVE' })
+        .expect(201);
+      await buy(app, channel.accessToken, item.id, 'EXCLUSIVE');
+
+      const provider = app.get<PaymentProvider>(PAYMENT_PROVIDER);
+      const refund = vi
+        .spyOn(provider, 'refund')
+        .mockRejectedValue(new Error('gateway down'));
+      const service = app.get(RefundsService);
+      // Stop the background job from racing this test: it would hit the same stub.
+      const enqueue = vi.spyOn(service, 'enqueue').mockResolvedValue(undefined);
+      try {
+        await request(server)
+          .post(`/api/v1/orders/${slow.body.orderId}/mock-pay`)
+          .set(auth(other.accessToken))
+          .expect(409);
+        const row = await orderRow(slow.body.orderId);
+        expect(row.status).toBe('REFUND_PENDING');
+
+        await expect(
+          service.process(row.providerPaymentId!, { finalAttempt: false }),
+        ).rejects.toThrow('gateway down');
+        expect((await refundsFor(row.id))[0]).toMatchObject({
+          status: 'PENDING',
+          attempts: 1,
+          lastError: 'gateway down',
+        });
+        await expect(
+          service.process(row.providerPaymentId!, { finalAttempt: true }),
+        ).rejects.toThrow('gateway down');
+        expect((await refundsFor(row.id))[0]).toMatchObject({
+          status: 'FAILED',
+          attempts: 2,
+        });
+        expect((await orderRow(row.id)).status).toBe('REFUND_FAILED');
+        // A FAILED refund is not retried by a stray job; only an admin retry re-opens it.
+        expect(
+          await service.process(row.providerPaymentId!, { finalAttempt: true }),
+        ).toBe('skipped');
+        expect(refund).toHaveBeenCalledTimes(2);
+      } finally {
+        refund.mockRestore();
+        enqueue.mockRestore();
+      }
+    });
+
+    it('remediates legacy orders: FAILED with a captured payment and no refund', async () => {
+      const { uploader, channel, item } = await setup();
+      void uploader;
+      const [legacy] = await db(app)
+        .insert(orders)
+        .values({
+          buyerId: channel.user.id,
+          mediaId: item.id,
+          licenseType: 'EXCLUSIVE',
+          amount: 5_000_00,
+          platformFee: 1_500_00,
+          uploaderShare: 3_500_00,
+          provider: 'mock',
+          providerOrderId: 'mock_order_legacy',
+          providerPaymentId: 'mock_pay_legacy',
+          status: 'FAILED',
+        })
+        .returning();
+      expect(
+        await app.get(RefundsService).remediateLegacyFailedPayments(),
+      ).toBe(1);
+      await waitForOrderStatus(app, legacy.id, 'REFUNDED');
+      // Running it again changes nothing.
+      expect(
+        await app.get(RefundsService).remediateLegacyFailedPayments(),
+      ).toBe(0);
+      expect(await refundsFor(legacy.id)).toHaveLength(1);
+    });
+
+    it('the database refuses a second PAID exclusive order for one media, whatever the code does', async () => {
+      const { channel, item } = await setup();
+      const other = await createApprovedChannel(app, 'Other News');
+      await buy(app, channel.accessToken, item.id, 'EXCLUSIVE');
+      await expect(
+        db(app).insert(orders).values({
+          buyerId: other.user.id,
+          mediaId: item.id,
+          licenseType: 'EXCLUSIVE',
+          amount: 5_000_00,
+          platformFee: 1_500_00,
+          uploaderShare: 3_500_00,
+          provider: 'mock',
+          providerOrderId: 'mock_order_second_exclusive',
+          providerPaymentId: 'mock_pay_second_exclusive',
+          status: 'PAID',
+        }),
+      ).rejects.toMatchObject({ cause: { code: '23505' } });
+      // And a split that does not add up.
+      await expect(
+        db(app).insert(orders).values({
+          buyerId: other.user.id,
+          mediaId: item.id,
+          licenseType: 'NON_EXCLUSIVE',
+          amount: 1_500_00,
+          platformFee: 450_00,
+          uploaderShare: 1_100_00,
+          provider: 'mock',
+          providerOrderId: 'mock_order_bad_split',
+        }),
+      ).rejects.toMatchObject({ cause: { code: '23514' } });
     });
   });
 

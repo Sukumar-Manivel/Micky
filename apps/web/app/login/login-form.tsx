@@ -6,16 +6,15 @@ import { useEffect, useState } from 'react';
 import { homeFor, useAuth } from '@/components/auth-provider';
 import { Alert, Button, Field, inputClass } from '@/components/ui';
 import { describeError } from '@/lib/api';
-
-/** Only allow same-site paths, so `?next=https://evil.example` cannot redirect users away. */
-export function safeNext(next: string | null): string | null {
-  return next && next.startsWith('/') && !next.startsWith('//') ? next : null;
-}
+import { safeNext } from './safe-next';
 
 export function LoginForm() {
   const { login, user, ready } = useAuth();
   const router = useRouter();
-  const next = safeNext(useSearchParams().get('next'));
+  const rawNext = useSearchParams().get('next');
+  // A client component, so `window` exists whenever this runs in the browser. During the
+  // server render there is no origin to compare against; nothing navigates there anyway.
+  const next = typeof window === 'undefined' ? null : safeNext(rawNext, window.location.origin);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 

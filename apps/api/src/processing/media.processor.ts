@@ -44,6 +44,8 @@ export class MediaProcessor extends WorkerHost implements OnApplicationBootstrap
         return this.processMedia(job as Job<ProcessMediaJobData>);
       case JOB.recomputeTrends:
         return { incidents: await this.incidents.recomputeActive() };
+      case JOB.prepareDelivery:
+        return { outcome: await this.prepareDelivery(job as Job<ProcessMediaJobData>) };
       default:
         throw new UnrecoverableError(`Unknown job ${job.name}`);
     }
@@ -67,6 +69,16 @@ export class MediaProcessor extends WorkerHost implements OnApplicationBootstrap
       );
       if (finalAttempt) await this.processing.markFailed(mediaId, GENERIC_FAILURE_MESSAGE);
       throw error; // BullMQ schedules the next attempt with exponential backoff
+    }
+  }
+
+  private async prepareDelivery(job: Job<ProcessMediaJobData>) {
+    try {
+      return await this.processing.prepareDelivery(job.data.mediaId);
+    } catch (err) {
+      // Never sell a file we could not clean: the download keeps answering "being prepared".
+      if (err instanceof PermanentProcessingError) throw new UnrecoverableError(err.message);
+      throw err;
     }
   }
 

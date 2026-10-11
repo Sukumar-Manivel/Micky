@@ -208,6 +208,7 @@ async function insertPaidOrder(mediaId: string) {
     status: 'PAID',
     provider: 'mock',
     providerOrderId: `mock_${randomUUID()}`,
+    providerPaymentId: `mock_pay_${randomUUID()}`,
     paidAt: new Date(),
   });
 }

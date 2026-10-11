@@ -1,5 +1,6 @@
 import { decidePreviewAccess, type PreviewViewer } from './preview-access.js';
-import { downloadFileName, formatIst, SEGMENT_NAME } from './stream.service.js';
+import { deliveryFileName, downloadFileName } from '../common/views.js';
+import { formatIst, SEGMENT_NAME } from './stream.service.js';
 
 describe('decidePreviewAccess', () => {
   const owner = 'owner-id';
@@ -22,6 +23,14 @@ describe('decidePreviewAccess', () => {
     expect(
       decidePreviewAccess(viewer('CHANNEL', { channelStatus: 'PENDING' }), { uploaderId: owner, status: 'APPROVED' }),
     ).toBe('forbidden');
+  });
+
+  it('closes previews for other channels once an exclusive licence is sold', () => {
+    const sold = { uploaderId: owner, status: 'APPROVED' as const, exclusiveSold: true };
+    expect(decidePreviewAccess(viewer('CHANNEL'), sold)).toBe('sold');
+    expect(decidePreviewAccess(viewer('CHANNEL', { holdsExclusive: true }), sold)).toBe('ok');
+    expect(decidePreviewAccess(viewer('UPLOADER', { id: owner }), sold)).toBe('ok');
+    expect(decidePreviewAccess(viewer('ADMIN'), sold)).toBe('ok');
   });
 
   it('uploaders can preview their own media unless it was removed', () => {
@@ -50,14 +59,23 @@ describe('formatIst', () => {
   });
 });
 
-describe('downloadFileName', () => {
-  it('keeps only safe characters and the storage extension', () => {
-    expect(downloadFileName({ title: 'Fire at "Marine Drive" / Kochi!', originalKey: 'originals/x/source.mp4' })).toBe(
+describe('downloadFileName / deliveryFileName (one name for JSON and Content-Disposition)', () => {
+  const row = (title: string, originalKey: string, mimeType = 'video/mp4') => ({ title, originalKey, mimeType });
+  it('keeps only safe characters and the delivered file\'s extension', () => {
+    expect(deliveryFileName(row('Fire at "Marine Drive" / Kochi!', 'originals/x/source.mp4'))).toBe(
       'Fire-at-Marine-Drive-Kochi.mp4',
     );
-    expect(downloadFileName({ title: '../../etc/passwd', originalKey: 'originals/x/source.MOV' })).toBe(
-      'etcpasswd.mov',
+    expect(deliveryFileName(row('../../etc/passwd', 'originals/x/source.MOV', 'video/quicktime'))).toBe('etcpasswd.mov');
+    expect(deliveryFileName(row('!!!', 'originals/x/source.jpg', 'image/jpeg'))).toBe('firstframe-media.jpg');
+  });
+
+  it('names HEIC photos .jpg, because they are delivered as JPEG', () => {
+    expect(deliveryFileName(row('Flood at the bridge', 'originals/x/source.heic', 'image/heic'))).toBe(
+      'Flood-at-the-bridge.jpg',
     );
-    expect(downloadFileName({ title: '!!!', originalKey: 'originals/x/source.jpg' })).toBe('firstframe-media.jpg');
+  });
+
+  it('never takes an extension it does not trust', () => {
+    expect(downloadFileName('Clip', '.exe/../x')).toBe('Clip');
   });
 });

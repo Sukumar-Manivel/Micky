@@ -3,6 +3,7 @@
 import { Logger } from '@nestjs/common';
 import { existsSync } from 'node:fs';
 import { MediaProcessor } from './processing/media.processor.js';
+import { PreviewRenderProcessor } from './processing/preview-render.processor.js';
 import { ProcessingScheduler } from './processing/processing.scheduler.js';
 import { createWorkerContext } from './worker.module.js';
 
@@ -13,7 +14,12 @@ if (process.env.NODE_ENV !== 'test') {
   const app = await createWorkerContext();
   const scheduler = app.get(ProcessingScheduler);
   await scheduler.scheduleTrendRecompute();
+  await scheduler.schedulePruneRenditions();
   await scheduler.requeueStuck();
+  await scheduler.queueMissingDeliveries();
+  // Two consumers, one FFmpeg job each (2-core VM): uploads (WORKER_CONCURRENCY, default 1)
+  // and per-newsroom preview renditions (always 1), so a newsroom never waits behind an upload.
   app.get(MediaProcessor).start();
-  new Logger('Worker').log('Worker started, waiting for media processing jobs');
+  app.get(PreviewRenderProcessor).start();
+  new Logger('Worker').log('Worker started, waiting for media processing and preview render jobs');
 }

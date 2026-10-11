@@ -1,7 +1,8 @@
 import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
 import { MediaQueue } from './media-queue.service.js';
-import { MEDIA_QUEUE } from './processing.constants.js';
+import { RedisService } from './redis.service.js';
+import { MEDIA_QUEUE, PREVIEW_QUEUE } from './processing.constants.js';
 
 /**
  * Producer side of media processing, imported by both processes:
@@ -13,8 +14,8 @@ import { MEDIA_QUEUE } from './processing.constants.js';
  * in WorkerModule, so the API process never runs FFmpeg.
  */
 @Module({
-  imports: [BullModule.registerQueue({ name: MEDIA_QUEUE })],
-  providers: [MediaQueue],
-  exports: [MediaQueue, BullModule],
+  imports: [BullModule.registerQueue({ name: MEDIA_QUEUE }, { name: PREVIEW_QUEUE })],
+  providers: [MediaQueue, RedisService],
+  exports: [MediaQueue, RedisService, BullModule],
 })
 export class ProcessingModule {}

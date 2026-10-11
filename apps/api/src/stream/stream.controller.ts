@@ -1,5 +1,18 @@
-import { Controller, Get, Header, HttpCode, Param, ParseUUIDPipe, Post, StreamableFile } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Header,
+  HttpCode,
+  HttpStatus,
+  Logger,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Res,
+  StreamableFile,
+} from '@nestjs/common';
 import { SkipThrottle, Throttle } from '@nestjs/throttler';
+import type { Response } from 'express';
 import { type AuthUser, CurrentUser, Public, Roles } from '../common/auth.decorators.js';
 import { type FileToSend, StreamService } from './stream.service.js';
 
@@ -14,6 +27,8 @@ const NO_STORE = 'private, no-store';
  */
 @Controller()
 export class StreamController {
+  private readonly logger = new Logger(StreamController.name);
+
   constructor(private readonly streams: StreamService) {}
 
   /**
@@ -25,8 +40,17 @@ export class StreamController {
   @HttpCode(200)
   @Roles('CHANNEL', 'ADMIN', 'UPLOADER')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
-  createPreview(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
-    return this.streams.createPreview(user, id);
+  async createPreview(
+    @CurrentUser() user: AuthUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const session = await this.streams.createPreview(user, id);
+    // 202 Accepted: the newsroom's marked rendition is still being made (first view).
+    if (session.kind === 'preparing') {
+      res.status(HttpStatus.ACCEPTED).setHeader('Retry-After', String(session.retryAfterSec));
+    }
+    return session;
   }
 
   // ---------- HLS preview (video) ----------
@@ -78,12 +102,33 @@ export class StreamController {
     return toStreamable(await this.streams.thumbnail(token));
   }
 
-  /** Rate limited (default limit): downloads are large and only needed once. */
+  /**
+   * The buyer's delivery copy. Single-use links (see StreamService.download), 20 per
+   * minute per IP. `downloadCount` goes up only when the whole file was sent
+   * ('finish' fires after the last byte is handed to the network; an aborted
+   * download only fires 'close').
+   */
   @Get('files/download/:token')
   @Public()
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @Header('Cache-Control', NO_STORE)
-  async download(@Param('token') token: string): Promise<StreamableFile> {
-    return toStreamable(await this.streams.download(token));
+  async download(@Param('token') token: string, @Res({ passthrough: true }) res: Response): Promise<StreamableFile> {
+    const file = await this.streams.download(token);
+    if (file.sha256) {
+      // So the buyer can check the bytes: hex for humans, RFC 9530 Repr-Digest for tools.
+      res.setHeader('X-Content-SHA256', file.sha256);
+      res.setHeader('Repr-Digest', `sha-256=:${Buffer.from(file.sha256, 'hex').toString('base64')}:`);
+    }
+    const orderId = file.orderId;
+    if (orderId) {
+      res.on('finish', () => {
+        if (res.statusCode !== 200) return;
+        this.streams
+          .countCompletedDownload(orderId)
+          .catch((err: Error) => this.logger.warn(`Could not count download of ${orderId}: ${err.message}`));
+      });
+    }
+    return toStreamable(file);
   }
 }
 

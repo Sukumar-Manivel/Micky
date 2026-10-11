@@ -4,6 +4,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { AdminModule } from './admin/admin.module.js';
 import { AuthModule } from './auth/auth.module.js';
+import { RedisThrottlerStorage } from './auth/rate-limit/redis-throttler.storage.js';
 import { JwtAuthGuard, RolesGuard } from './common/auth.guards.js';
 import { SigningModule } from './common/signing.service.js';
 import { UrlModule } from './common/urls.service.js';
@@ -34,8 +35,24 @@ import { StreamModule } from './stream/stream.module.js';
       inject: [AppConfig],
       useFactory: (config: AppConfig) => ({ connection: { url: config.redisUrl } }),
     }),
-    // 100 requests per minute per IP by default; stricter limits on auth routes.
-    ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 100 }]),
+    // Rate limits per client IP, counted in Redis so they hold across processes and restarts.
+    // `default`: 100 requests per minute on every route; stricter on auth routes.
+    // `long`: an hourly cap, applied only to routes that set one with @Throttle({ long: ... }).
+    ThrottlerModule.forRootAsync({
+      inject: [RedisThrottlerStorage],
+      useFactory: (storage: RedisThrottlerStorage) => ({
+        storage,
+        throttlers: [
+          { name: 'default', ttl: 60_000, limit: 100 },
+          {
+            name: 'long',
+            ttl: 3_600_000,
+            limit: 1_000,
+            skipIf: (context) => Reflect.getMetadata('THROTTLER:LIMITlong', context.getHandler()) === undefined,
+          },
+        ],
+      }),
+    }),
 
     // Features
     AuthModule,

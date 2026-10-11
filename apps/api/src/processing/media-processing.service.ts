@@ -2,35 +2,64 @@ import { Injectable, Logger } from '@nestjs/common';
 import { and, asc, eq, gt, ne, sql } from 'drizzle-orm';
 import exifr from 'exifr';
 import { randomBytes } from 'node:crypto';
-import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { open as openFile, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { AppConfig } from '../config/app-config.js';
 import { type Database, InjectDb } from '../db/db.module.js';
-import { media, verifications } from '../db/schema.js';
+import { channelProfiles, media, users, verifications } from '../db/schema.js';
 import { IncidentsService } from '../incidents/incidents.service.js';
+import { sha256File } from '../media/upload-files.js';
 import { StorageService, storageKeys } from '../storage/storage.service.js';
+import {
+  ALLOWED_PHOTO_TAGS,
+  ALLOWED_VIDEO_TAGS,
+  type DeliveryInfo,
+  deliveryExt,
+  deliveryKey,
+  deliveryMimeType,
+  readDeliveryInfo,
+} from './delivery.js';
 import { PermanentProcessingError } from './errors.js';
 import {
-  encodeHlsPreview,
+  encodeMezzanine,
   ffprobe,
   firstFrameRotation,
+  MAX_DECODE_PIXELS,
   makeWatermark,
   photoFrame,
+  reencodePhotoAsJpeg,
+  renderViewerHls,
   renderWatermarkedJpeg,
   sampleVideoFrames,
+  segmentHls,
+  stripVideoMetadata,
 } from './ffmpeg.js';
+import { ImageFormatError, imageDimensions, imageFormatOf, stripImageMetadata } from './image-files.js';
 import { type ExifData, type FileMetadata, fitWithin, readExif, readVideoProbe, uprightSize } from './media-metadata.js';
+import {
+  PHOTO_PREVIEW,
+  previewKeys,
+  THUMBNAIL,
+  VIEWER_MARK,
+  videoPreviewPlan,
+  viewerMarkText,
+} from './preview-plan.js';
 import { DUPLICATE_MAX_DISTANCE, isInformativePhash, minDistance } from './phash.js';
 import { assessRisk } from './risk.js';
 import { VerifierClient, type VerifierResult, VerifierUnavailableError } from './verifier.client.js';
 
 type MediaRow = typeof media.$inferSelect;
 
-/** Preview sizes. Video: 480p, the most a channel needs to judge footage, too low to broadcast. */
-const VIDEO_PREVIEW = { long: 854, short: 480 };
-const PHOTO_PREVIEW = { long: 1280, short: 1280 };
-const THUMBNAIL = { long: 480, short: 480 };
+/**
+ * Decompression-bomb and abuse limits (docs/learning/media-and-processing.md, "Limits").
+ * Photos: 50 megapixels (a 200 MP phone mode is refused; normal phones shoot 12–50 MP).
+ * Videos: 4K. Checked from headers before any frame is decoded.
+ */
+export const MAX_PHOTO_PIXELS = MAX_DECODE_PIXELS;
+export const MAX_VIDEO_PIXELS = 4096 * 2304;
+/** Bytes of a photo read to find its declared size (JPEG EXIF blocks can be up to 64 KB). */
+const HEADER_BYTES = 256 * 1024;
 /** Frames sent to the AI detector: enough to cover a clip, few enough for a CPU model. */
 const MAX_VERIFIER_FRAMES = 8;
 /** Rows read per batch during the duplicate search. */
@@ -97,8 +126,14 @@ export class MediaProcessingService {
 
       if (!hasPreviewOutputs(row)) await this.makePreviews(row, original, probed, workDir);
 
-      const existing = await this.db.query.verifications.findFirst({ where: eq(verifications.mediaId, mediaId) });
-      if (!existing) await this.verify(row, original, probed, workDir, opts);
+      let existing = await this.db.query.verifications.findFirst({ where: eq(verifications.mediaId, mediaId) });
+      if (!existing) {
+        await this.verify(row, original, probed, workDir, opts);
+        existing = await this.db.query.verifications.findFirst({ where: eq(verifications.mediaId, mediaId) });
+      }
+
+      // The copy buyers download, without the witness's name, GPS or device (H3).
+      if (!readDeliveryInfo(existing?.metadata)) await this.makeDelivery(row, original, workDir);
 
       await this.incidents.assignIncident(mediaId);
 
@@ -135,6 +170,9 @@ export class MediaProcessingService {
     }
     const video = readVideoProbe(probe);
     if (!video) throw new PermanentProcessingError('we could not find a video track in this file.');
+    if (video.width * video.height > MAX_VIDEO_PIXELS) {
+      throw new PermanentProcessingError('videos can be at most 4K (3840 × 2160).');
+    }
     if (video.durationSec !== null && video.durationSec > this.config.maxVideoDurationSec) {
       const minutes = Math.floor(this.config.maxVideoDurationSec / 60);
       throw new PermanentProcessingError(`videos can be at most ${minutes} minutes long.`);
@@ -155,6 +193,8 @@ export class MediaProcessingService {
   }
 
   private async probePhoto(file: string): Promise<Probed> {
+    // Decompression-bomb guard first, from the header alone: nothing has been decoded yet.
+    checkPhotoPixels(imageDimensions(await readHeader(file, HEADER_BYTES)));
     let width: number;
     let height: number;
     let rotation: number;
@@ -199,36 +239,23 @@ export class MediaProcessingService {
   private async makePreviews(row: MediaRow, original: string, probed: Probed, workDir: string) {
     const thumbSize = fitWithin(probed.width, probed.height, THUMBNAIL.long, THUMBNAIL.short);
     const thumbFile = path.join(workDir, 'thumb.jpg');
-    const thumbWatermark = await makeWatermark(workDir, thumbSize.width, thumbSize.height);
+    const thumbWatermark = await makeWatermark(workDir, thumbSize.width, thumbSize.height, { name: 'thumb-mark' });
 
     let previewKey: string;
     let hlsKeyHex: string | null = null;
 
     if (row.type === 'VIDEO') {
-      const size = fitWithin(probed.width, probed.height, VIDEO_PREVIEW.long, VIDEO_PREVIEW.short);
-      const watermark = await makeWatermark(workDir, size.width, size.height);
       // A fresh random AES-128 key per video. It is stored in the database (hls_key_hex),
       // never next to the segments, and served only through the token-checked key route.
       const key = randomBytes(16);
-      const keyFile = path.join(workDir, 'hls.key');
-      await writeFile(keyFile, key);
-      const hlsOut = path.join(workDir, 'hls');
-      await mkdir(hlsOut);
-      await encodeHlsPreview({
-        input: original,
-        watermark,
-        width: size.width,
-        height: size.height,
-        maxSeconds: this.config.previewMaxSeconds,
-        keyFile,
-        workDir,
-        outDir: hlsOut,
-      });
-      // Remove leftovers of an earlier attempt (it may have produced more segments).
+      const mezzanine = await this.encodeMezzanineFile(original, probed, workDir);
+      const hlsOut = await this.segmentGenericHls(mezzanine, key, workDir);
+      // Remove leftovers of an earlier attempt (it may have produced more segments),
+      // and any per-newsroom renditions of an older preview.
       await this.storage.deletePrefix(storageKeys.hlsDir(row.id));
-      await this.storage.putDirectory(storageKeys.hlsDir(row.id), hlsOut, (name) =>
-        name.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t',
-      );
+      await this.storage.deletePrefix(previewKeys.viewerRoot(row.id));
+      await this.storage.putFile(previewKeys.mezzanine(row.id), mezzanine, 'video/mp4');
+      await this.storage.putDirectory(storageKeys.hlsDir(row.id), hlsOut, hlsContentType);
       previewKey = storageKeys.hlsDir(row.id);
       hlsKeyHex = key.toString('hex');
 
@@ -237,10 +264,11 @@ export class MediaProcessingService {
       await renderWatermarkedJpeg({ input: original, watermark: thumbWatermark, output: thumbFile, ...thumbSize, atSecond: at });
     } else {
       const size = fitWithin(probed.width, probed.height, PHOTO_PREVIEW.long, PHOTO_PREVIEW.short);
-      const watermark = await makeWatermark(workDir, size.width, size.height);
+      const watermark = await makeWatermark(workDir, size.width, size.height, { name: 'preview-mark' });
       const previewFile = path.join(workDir, 'preview.jpg');
       // No `orient` filters: FFmpeg already applies the EXIF rotation when decoding.
       await renderWatermarkedJpeg({ input: original, watermark, output: previewFile, ...size });
+      await this.storage.deletePrefix(previewKeys.viewerRoot(row.id));
       await this.storage.putFile(storageKeys.previewImage(row.id), previewFile, 'image/jpeg');
       previewKey = storageKeys.previewImage(row.id);
       await renderWatermarkedJpeg({ input: original, watermark: thumbWatermark, output: thumbFile, ...thumbSize });
@@ -259,6 +287,99 @@ export class MediaProcessingService {
         height: probed.height,
       })
       .where(eq(media.id, row.id));
+  }
+
+  /** The capped, scaled, generically marked private MP4 that every video rendition is cut from. */
+  private async encodeMezzanineFile(original: string, probed: Pick<Probed, 'durationSec' | 'width' | 'height'>, workDir: string) {
+    const plan = videoPreviewPlan(probed.durationSec, this.config.previewMaxSeconds);
+    const size = fitWithin(probed.width, probed.height, plan.size.long, plan.size.short);
+    const watermark = await makeWatermark(workDir, size.width, size.height, { ...plan.mark, name: 'preview-mark' });
+    const output = path.join(workDir, 'mezzanine.mp4');
+    await encodeMezzanine({ input: original, watermark, ...size, maxSeconds: plan.seconds, output });
+    return output;
+  }
+
+  private async segmentGenericHls(mezzanine: string, key: Buffer, workDir: string): Promise<string> {
+    const keyFile = path.join(workDir, 'hls.key');
+    await writeFile(keyFile, key);
+    const outDir = path.join(workDir, 'hls');
+    await mkdir(outDir);
+    await segmentHls({ input: mezzanine, keyFile, workDir, outDir });
+    await rm(keyFile, { force: true });
+    return outDir;
+  }
+
+  // ---------- 2b. Per-newsroom preview renditions (H4) ----------
+
+  /**
+   * Burns "ORGANISATION · VIEWER-ID" into the pixels of one newsroom's copy of the
+   * preview, so a screen recording or a ripped stream names who leaked it. Rendered
+   * on the first view and cached in storage; see PreviewRenderProcessor.
+   * Returns false when there is nothing to render (media gone, not a channel...).
+   */
+  async renderViewerPreview(mediaId: string, viewerId: string): Promise<boolean> {
+    const row = await this.db.query.media.findFirst({ where: eq(media.id, mediaId) });
+    const [viewer] = await this.db
+      .select({ name: users.name, role: users.role, organization: channelProfiles.organization })
+      .from(users)
+      .leftJoin(channelProfiles, eq(channelProfiles.userId, users.id))
+      .where(eq(users.id, viewerId))
+      .limit(1);
+    if (!row || !viewer || row.status === 'REMOVED' || !row.previewKey) return false;
+    const text = viewerMarkText(viewer.organization ?? viewer.name, viewerId);
+
+    const workDir = await mkdtemp(path.join(tmpdir(), `firstframe-render-${mediaId}-`));
+    try {
+      if (row.type === 'PHOTO') {
+        const base = path.join(workDir, 'preview.jpg');
+        await this.storage.downloadTo(storageKeys.previewImage(row.id), base);
+        const size = await frameSize(base);
+        const mark = await makeWatermark(workDir, size.width, size.height, { ...VIEWER_MARK, text, angleDeg: -25, name: 'viewer' });
+        const output = path.join(workDir, 'image.jpg');
+        await renderWatermarkedJpeg({ input: base, watermark: mark, output, ...size });
+        await this.storage.putFile(previewKeys.viewerImage(row.id, viewerId), output, 'image/jpeg');
+        return true;
+      }
+
+      const key = Buffer.from(row.hlsKeyHex ?? '', 'hex');
+      if (key.length !== 16) return false;
+      const mezzanine = await this.loadOrMakeMezzanine(row, workDir);
+      const size = await frameSize(mezzanine);
+      const plan = videoPreviewPlan(row.durationSec, this.config.previewMaxSeconds);
+      const mark = await makeWatermark(workDir, size.width, size.height, { ...VIEWER_MARK, text, angleDeg: -25, name: 'viewer' });
+      const keyFile = path.join(workDir, 'hls.key');
+      await writeFile(keyFile, key);
+      const outDir = path.join(workDir, 'hls');
+      await mkdir(outDir);
+      const started = Date.now();
+      await renderViewerHls({ input: mezzanine, overlay: mark, maxrateKbps: plan.viewerMaxrateKbps, keyFile, workDir, outDir });
+      await rm(keyFile, { force: true });
+      const dir = previewKeys.viewerDir(row.id, viewerId);
+      await this.storage.deletePrefix(dir);
+      // The playlist last: its presence is what tells the API the rendition is ready.
+      const names = (await readdir(outDir)).sort((a, b) => Number(a === 'index.m3u8') - Number(b === 'index.m3u8'));
+      for (const name of names) await this.storage.putFile(`${dir}/${name}`, path.join(outDir, name), hlsContentType(name));
+      this.logger.log(`Rendered preview of ${row.id} for viewer ${viewerId} in ${Date.now() - started} ms`);
+      return true;
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+  }
+
+  /** Media processed before mezzanines existed get one now, with today's preview caps. */
+  private async loadOrMakeMezzanine(row: MediaRow, workDir: string): Promise<string> {
+    const file = path.join(workDir, 'mezzanine.mp4');
+    try {
+      await this.storage.downloadTo(previewKeys.mezzanine(row.id), file);
+      return file;
+    } catch {
+      const original = path.join(workDir, `original${path.extname(row.originalKey)}`);
+      await this.storage.downloadTo(row.originalKey, original);
+      const probed = await this.probeVideo(original);
+      const made = await this.encodeMezzanineFile(original, probed, workDir);
+      await this.storage.putFile(previewKeys.mezzanine(row.id), made, 'video/mp4');
+      return made;
+    }
   }
 
   // ---------- 3. Verify ----------
@@ -360,6 +481,87 @@ export class MediaProcessingService {
       .onConflictDoUpdate({ target: verifications.mediaId, set: { ...values, mediaId: undefined } });
   }
 
+  // ---------- 3b. Delivery copy (H3) ----------
+
+  /**
+   * Builds the buyer's copy of a media item that has already been processed
+   * (job `prepare-delivery`: backfill for older uploads, or a download that found none).
+   */
+  async prepareDelivery(mediaId: string): Promise<'prepared' | 'skipped'> {
+    const row = await this.db.query.media.findFirst({ where: eq(media.id, mediaId) });
+    if (!row || row.status === 'PROCESSING' || row.status === 'FAILED') return 'skipped';
+    const verification = await this.db.query.verifications.findFirst({ where: eq(verifications.mediaId, mediaId) });
+    if (!verification || readDeliveryInfo(verification.metadata)) return 'skipped';
+    const workDir = await mkdtemp(path.join(tmpdir(), `firstframe-delivery-${mediaId}-`));
+    try {
+      const original = path.join(workDir, `original${path.extname(row.originalKey)}`);
+      await this.storage.downloadTo(row.originalKey, original);
+      await this.makeDelivery(row, original, workDir);
+      return 'prepared';
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Writes the delivery copy (no GPS, device, owner name...) next to the original and
+   * records its checksum in the verification's metadata. The copy is checked after it
+   * is made: if any identifying tag survived, it is refused rather than sold.
+   */
+  private async makeDelivery(row: MediaRow, original: string, workDir: string): Promise<DeliveryInfo> {
+    const output = path.join(workDir, `delivery${deliveryExt(row)}`);
+    const mimeType = deliveryMimeType(row.mimeType);
+
+    if (row.type === 'VIDEO') {
+      const probe = await ffprobe(original);
+      const creation = probe.format?.tags?.creation_time;
+      await stripVideoMetadata({
+        input: original,
+        output,
+        creationTime: creation && !Number.isNaN(Date.parse(creation)) ? new Date(creation).toISOString() : null,
+        mp4Family: row.mimeType !== 'video/webm',
+      });
+      assertCleanVideo(await ffprobe(output));
+    } else {
+      const format = imageFormatOf(row.mimeType);
+      if (format) {
+        const [orientation, raw] = await Promise.all([
+          exifr.orientation(original).catch(() => undefined),
+          exifr.parse(original, { pick: ['DateTimeOriginal'], reviveValues: false }).catch(() => undefined) as Promise<
+            { DateTimeOriginal?: string } | undefined
+          >,
+        ]);
+        try {
+          const cleaned = stripImageMetadata(format, await readFile(original), {
+            orientation: orientation ?? null,
+            dateTimeOriginal: raw?.DateTimeOriginal ?? null,
+          });
+          await writeFile(output, cleaned);
+        } catch (err) {
+          if (!(err instanceof ImageFormatError)) throw err;
+          throw new PermanentProcessingError('the photo file is damaged, so we cannot prepare it for sale.');
+        }
+      } else {
+        await reencodePhotoAsJpeg(original, output);
+      }
+      await assertCleanPhoto(output, format);
+    }
+
+    const info: DeliveryInfo = {
+      key: deliveryKey(row),
+      sha256: await sha256File(output),
+      sizeBytes: (await stat(output)).size,
+      mimeType,
+      createdAt: new Date().toISOString(),
+    };
+    await this.storage.putFile(info.key, output, mimeType);
+    await this.db
+      .update(verifications)
+      .set({ metadata: sql`${verifications.metadata} || ${JSON.stringify({ delivery: info })}::jsonb` })
+      .where(eq(verifications.mediaId, row.id));
+    return info;
+  }
+
   /**
    * Finds the closest earlier upload whose frames look like ours (pHash Hamming
    * distance ≤ 8 bits on any pair of frames). Scans verifications in batches of
@@ -406,4 +608,57 @@ export class MediaProcessingService {
 function hasPreviewOutputs(row: MediaRow): boolean {
   if (!row.previewKey || !row.thumbKey) return false;
   return row.type === 'PHOTO' || !!row.hlsKeyHex;
+}
+
+function hlsContentType(name: string): string {
+  return name.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
+}
+
+/** Width × height of the first video stream of a file we made ourselves (preview, mezzanine). */
+async function frameSize(file: string): Promise<{ width: number; height: number }> {
+  const stream = (await ffprobe(file)).streams?.find((s) => s.codec_type === 'video');
+  if (!stream?.width || !stream.height) throw new Error(`no video stream in ${path.basename(file)}`);
+  return { width: stream.width, height: stream.height };
+}
+
+async function readHeader(file: string, bytes: number): Promise<Buffer> {
+  const handle = await openFile(file, 'r');
+  try {
+    const buffer = Buffer.alloc(bytes);
+    const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Refuses photos whose header declares more than MAX_PHOTO_PIXELS (or a zero size). */
+export function checkPhotoPixels(size: { width: number; height: number } | null): void {
+  if (!size) return; // unknown header (HEIC): FFmpeg's max_pixels still guards the decode
+  if (size.width <= 0 || size.height <= 0) {
+    throw new PermanentProcessingError('the photo looks damaged or uses a format we cannot read yet.');
+  }
+  if (size.width * size.height > MAX_PHOTO_PIXELS) {
+    throw new PermanentProcessingError(`photos can be at most ${MAX_PHOTO_PIXELS / 1_000_000} megapixels.`);
+  }
+}
+
+/** Every tag left on the delivery video must be in ALLOWED_VIDEO_TAGS, and only audio/video streams may remain. */
+export function assertCleanVideo(probe: Awaited<ReturnType<typeof ffprobe>>): void {
+  const tags = [probe.format?.tags ?? {}, ...(probe.streams ?? []).map((st) => st.tags ?? {})];
+  const leftover = tags.flatMap((t) => Object.keys(t)).filter((k) => !ALLOWED_VIDEO_TAGS.has(k.toLowerCase()));
+  const otherStreams = (probe.streams ?? []).filter((st) => st.codec_type !== 'video' && st.codec_type !== 'audio');
+  if (leftover.length || otherStreams.length) {
+    throw new Error(`delivery copy still has metadata: ${[...leftover, ...otherStreams.map((st) => st.codec_type)].join(', ')}`);
+  }
+}
+
+/** Re-reads the delivery photo: only orientation and capture time may be left. */
+async function assertCleanPhoto(file: string, format: ReturnType<typeof imageFormatOf>): Promise<void> {
+  if (format === 'webp') return; // exifr cannot read WebP; stripWebp keeps only image chunks (see its tests)
+  const found = (await exifr
+    .parse(file, { tiff: true, exif: true, gps: true, ifd1: true, xmp: true, iptc: true, icc: false, makerNote: true, userComment: true })
+    .catch(() => null)) as Record<string, unknown> | null;
+  const leftover = Object.keys(found ?? {}).filter((k) => !ALLOWED_PHOTO_TAGS.has(k));
+  if (leftover.length) throw new Error(`delivery copy still has metadata: ${leftover.join(', ')}`);
 }

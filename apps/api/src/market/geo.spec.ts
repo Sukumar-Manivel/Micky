@@ -37,3 +37,12 @@ describe('escapeLike', () => {
     expect(escapeLike('plain text')).toBe('plain text');
   });
 });
+
+describe('publicCoordinate (review M8)', () => {
+  it('rounds published coordinates to 3 decimals (about 100 m)', async () => {
+    const { publicCoordinate } = await import('../common/views.js');
+    expect(publicCoordinate(11.016844)).toBe(11.017);
+    expect(publicCoordinate(76.955832)).toBe(76.956);
+    expect(publicCoordinate(-0.0004)).toBe(-0);
+  });
+});

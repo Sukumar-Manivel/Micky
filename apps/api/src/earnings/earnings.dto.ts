@@ -17,6 +17,14 @@ export class PayoutDetailsDto {
     message: 'Enter a valid UPI ID, e.g. yourname@okaxis',
   })
   upiId: string;
+
+  /**
+   * The account password, required to change where money is sent (review M4): a stolen
+   * access token alone must not be enough to redirect an uploader's earnings.
+   */
+  @IsString()
+  @Length(1, 200)
+  currentPassword: string;
 }
 
 export class RequestPayoutDto {

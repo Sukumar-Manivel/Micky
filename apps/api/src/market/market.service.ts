@@ -3,10 +3,10 @@ import { and, count, desc, eq, gte, ilike, inArray, isNotNull, or, type SQL, sql
 import type { AuthUser } from '../common/auth.decorators.js';
 import { offsetOf, type Paginated, paginated } from '../common/pagination.js';
 import { UrlService } from '../common/urls.service.js';
-import { type MediaMarketView, toMediaMarketView } from '../common/views.js';
+import { type MediaMarketView, PUBLIC_COORDINATE_DECIMALS, publicCoordinate, toMediaMarketView } from '../common/views.js';
 import { type Database, InjectDb } from '../db/db.module.js';
 import { incidents, media, orders, verifications } from '../db/schema.js';
-import { escapeLike, withinRadius } from './geo.js';
+import { escapeLike, publicCoordinateSql, withinRadius } from './geo.js';
 import { DEFAULT_RADIUS_KM, type MarketIncidentsQuery, type MarketMediaQuery } from './market.dto.js';
 
 type MediaRow = typeof media.$inferSelect;
@@ -78,8 +78,8 @@ export class MarketService {
     let distance: SQL<number> | undefined;
     if (point) {
       const radius = withinRadius(
-        media.latitude,
-        media.longitude,
+        publicCoordinateSql(media.latitude, PUBLIC_COORDINATE_DECIMALS),
+        publicCoordinateSql(media.longitude, PUBLIC_COORDINATE_DECIMALS),
         point.lat,
         point.lng,
         query.radiusKm ?? DEFAULT_RADIUS_KM,
@@ -166,8 +166,13 @@ export class MarketService {
     if (query.category) conditions.push(eq(incidents.category, query.category));
     if (point) {
       conditions.push(
-        withinRadius(incidents.latitude, incidents.longitude, point.lat, point.lng, query.radiusKm ?? DEFAULT_RADIUS_KM)
-          .where,
+        withinRadius(
+          publicCoordinateSql(incidents.latitude, PUBLIC_COORDINATE_DECIMALS),
+          publicCoordinateSql(incidents.longitude, PUBLIC_COORDINATE_DECIMALS),
+          point.lat,
+          point.lng,
+          query.radiusKm ?? DEFAULT_RADIUS_KM,
+        ).where,
       );
     }
     const where = and(...conditions);
@@ -261,6 +266,8 @@ export class MarketService {
         paidOrderCount: paidCountByMedia.get(row.id) ?? 0,
         purchased: purchasedByMedia.get(row.id) ?? null,
         includeMetadata: user.role === 'ADMIN',
+        // Exact point: admins only. Buyers too get the rounded point (no uploader opt-in yet).
+        exactLocation: user.role === 'ADMIN',
         distanceKm: distances?.get(row.id),
       }),
     );
@@ -285,8 +292,9 @@ export class MarketService {
       id: row.id,
       title: row.title,
       category: row.category,
-      latitude: row.latitude,
-      longitude: row.longitude,
+      // Incidents start at their first upload's point: rounded like media (review M8).
+      latitude: publicCoordinate(row.latitude),
+      longitude: publicCoordinate(row.longitude),
       locationName: row.locationName,
       firstSeenAt: row.firstSeenAt.toISOString(),
       lastSeenAt: row.lastSeenAt.toISOString(),

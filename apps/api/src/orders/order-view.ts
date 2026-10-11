@@ -16,7 +16,12 @@ export interface OrderView {
   amount: number;
   currency: 'INR';
   createdAt: string;
+  /** Until when an unpaid checkout can be paid (the quoted price is honoured until then). */
+  expiresAt: string;
   paidAt: string | null;
+  refundedAt: string | null;
+  /** Why the order is not (or no longer) PAID, e.g. the licence was sold meanwhile. */
+  statusReason: string | null;
   downloadCount: number;
   media: {
     id: string;
@@ -32,6 +37,8 @@ export interface CheckoutView {
   amount: number;
   currency: 'INR';
   provider: 'razorpay' | 'mock';
+  /** The checkout must be paid before this moment; later payments are refunded. */
+  expiresAt: string;
   razorpay?: { keyId: string; orderId: string };
   description: string;
 }
@@ -48,7 +55,10 @@ export function toOrderView(
     amount: order.amount,
     currency: 'INR',
     createdAt: order.createdAt.toISOString(),
+    expiresAt: order.expiresAt.toISOString(),
     paidAt: order.paidAt?.toISOString() ?? null,
+    refundedAt: order.refundedAt?.toISOString() ?? null,
+    statusReason: order.statusReason,
     downloadCount: order.downloadCount,
     media: {
       id: item.id,

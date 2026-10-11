@@ -2,6 +2,7 @@
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { sql } from 'drizzle-orm';
 import request from 'supertest';
+import { RedisThrottlerStorage } from '../src/auth/rate-limit/redis-throttler.storage.js';
 import { DB, type Database } from '../src/db/db.module.js';
 import { createApp } from '../src/main.js';
 
@@ -11,13 +12,24 @@ export async function startApp(): Promise<NestExpressApplication> {
   return app;
 }
 
-/** Empties every table between tests, so each test starts from a clean database. */
+/**
+ * Empties every table between tests, so each test starts from a clean database, and clears the
+ * Redis rate-limit and login-backoff counters (all requests in tests come from one IP).
+ * Tables are listed from the catalogue, so tables added by new migrations are included.
+ */
 export async function resetDb(app: NestExpressApplication) {
-  const db = app.get<Database>(DB);
-  await db.execute(sql`
-    TRUNCATE users, uploader_profiles, channel_profiles, refresh_tokens, incidents, media,
-      verifications, orders, payouts, ledger_entries, webhook_events, reports
-    RESTART IDENTITY CASCADE`);
+  const database = app.get<Database>(DB);
+  const { rows } = await database.execute<{ name: string }>(sql`
+    SELECT quote_ident(tablename) AS name FROM pg_tables WHERE schemaname = 'public'`);
+  if (rows.length) {
+    await database.execute(sql.raw(`TRUNCATE ${rows.map((r) => r.name).join(', ')} RESTART IDENTITY CASCADE`));
+  }
+  await clearRateLimits(app);
+}
+
+/** Resets the per-IP rate limits and per-account login backoff (they live in Redis). */
+export async function clearRateLimits(app: NestExpressApplication) {
+  await app.get(RedisThrottlerStorage).reset();
 }
 
 export function db(app: NestExpressApplication): Database {

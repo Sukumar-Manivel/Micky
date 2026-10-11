@@ -22,20 +22,39 @@ x-logging: &logging
     max-size: "10m" # rotate logs so they can't fill the disk
     max-file: "3"
 
-x-api-common: &api-common
+# Settings shared by the API and the worker. No `env_file`: each service lists exactly the
+# variables it needs, so a compromised container holds only its own secrets (REVIEW L3).
+# Backup credentials (BACKUP_*), ADMIN_PASSWORD and POSTGRES_PASSWORD (except inside
+# DATABASE_URL) never reach the application containers. Tunables come from .env with defaults.
+x-app-env: &app-env
+  NODE_ENV: production
+  PUBLIC_API_URL: https://${API_DOMAIN}
+  WEB_URL: https://${WEB_DOMAIN}
+  CORS_ORIGINS: https://${WEB_DOMAIN}
+  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+  REDIS_URL: redis://redis:6379
+  STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
+  STORAGE_LOCAL_DIR: /data/storage
+  UPLOAD_TMP_DIR: /data/tmp/uploads
+  # Only used with STORAGE_DRIVER=s3 (media in R2); empty otherwise.
+  S3_ENDPOINT: ${S3_ENDPOINT:-}
+  S3_REGION: ${S3_REGION:-auto}
+  S3_BUCKET: ${S3_BUCKET:-}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+  S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+  MAX_VIDEO_BYTES: ${MAX_VIDEO_BYTES:-}
+  MAX_PHOTO_BYTES: ${MAX_PHOTO_BYTES:-}
+  MAX_VIDEO_DURATION_SEC: ${MAX_VIDEO_DURATION_SEC:-}
+  PREVIEW_MAX_SECONDS: ${PREVIEW_MAX_SECONDS:-}
+  PLATFORM_FEE_PERCENT: ${PLATFORM_FEE_PERCENT:-30}
+  MIN_PAYOUT_PAISE: ${MIN_PAYOUT_PAISE:-}
+  EARNINGS_HOLD_DAYS: ${EARNINGS_HOLD_DAYS:-}
+  PAYOUT_COOLDOWN_HOURS: ${PAYOUT_COOLDOWN_HOURS:-}
+
+x-app-common: &app-common
   image: ${IMAGE_PREFIX:?set IMAGE_PREFIX in .env}/firstframe-api:${IMAGE_TAG:-latest}
-  env_file: .env
-  environment: &api-env
-    NODE_ENV: production
-    PORT: "4000"
-    PUBLIC_API_URL: https://${API_DOMAIN}
-    WEB_URL: https://${WEB_DOMAIN}
-    CORS_ORIGINS: https://${WEB_DOMAIN}
-    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-    REDIS_URL: redis://redis:6379
-    VERIFIER_URL: http://verifier:8000
-    STORAGE_LOCAL_DIR: /data/storage
-    UPLOAD_TMP_DIR: /data/tmp/uploads
   logging: *logging
 
 services:
@@ -132,8 +151,11 @@ services:
 
   # One-shot: applies pending migrations and exits. `up` runs it before api/worker.
   migrate:
-    <<: *api-common
+    <<: *app-common
     command: ["node", "dist/db/migrate.js"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     restart: "no"
     networks: [backend]
     healthcheck:
@@ -144,8 +166,14 @@ services:
 
   # Run once after the first deploy: docker compose run --rm seed
   seed:
-    <<: *api-common
+    <<: *app-common
     command: ["node", "dist/db/seed.js"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_NAME: ${ADMIN_NAME:-FirstFrame Admin}
     restart: "no"
     profiles: ["tools"]
     networks: [backend]
@@ -156,11 +184,28 @@ services:
         condition: service_healthy
 
   api:
-    <<: *api-common
+    <<: *app-common
     restart: unless-stopped
     environment:
-      <<: *api-env
+      <<: *app-env
+      APP_ROLE: api
+      PORT: "4000"
       NODE_OPTIONS: --enable-source-maps --max-old-space-size=768
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET}
+      SIGNING_SECRET: ${SIGNING_SECRET:?set SIGNING_SECRET}
+      JWT_ACCESS_TTL_SEC: ${JWT_ACCESS_TTL_SEC:-}
+      REFRESH_TTL_DAYS: ${REFRESH_TTL_DAYS:-}
+      SESSION_MAX_DAYS: ${SESSION_MAX_DAYS:-}
+      LOGIN_FREE_ATTEMPTS: ${LOGIN_FREE_ATTEMPTS:-}
+      LOGIN_BACKOFF_BASE_SEC: ${LOGIN_BACKOFF_BASE_SEC:-}
+      LOGIN_BACKOFF_MAX_SEC: ${LOGIN_BACKOFF_MAX_SEC:-}
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}
+      # Caddy is the only proxy hop. Keep API_DOMAIN "DNS only" in Cloudflare (docs/DEPLOYMENT.md).
+      TRUST_PROXY_HOPS: "1"
+      PAYMENTS_PROVIDER: ${PAYMENTS_PROVIDER:-razorpay}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
     volumes:
       - mediadata:/data
     networks: [edge, backend] # edge: Caddy + internet (R2, Razorpay); backend: db, redis
@@ -174,15 +219,21 @@ services:
         limits: { memory: 1024M }
 
   worker:
-    <<: *api-common
+    <<: *app-common
     command: ["node", "dist/worker.js"]
     restart: unless-stopped
     environment:
-      <<: *api-env
+      <<: *app-env
+      APP_ROLE: worker
       NODE_OPTIONS: --enable-source-maps --max-old-space-size=512
+      VERIFIER_URL: http://verifier:8000
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?set INTERNAL_TOKEN}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
     volumes:
       - mediadata:/data
-    networks: [edge, backend]
+    # backend only: the worker parses untrusted media with ffmpeg, so it gets no route to the
+    # internet (REVIEW L3). With STORAGE_DRIVER=s3 it must reach R2: add `edge` here.
+    networks: [backend]
     healthcheck:
       disable: true # the image's healthcheck probes the HTTP API
     stop_grace_period: 60s # let a running ffmpeg job finish or be re-queued cleanly

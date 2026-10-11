@@ -2,6 +2,7 @@
 // Keeping them in one place means the uploader dashboard, the admin queue and the
 // marketplace always describe a media item the same way.
 import type { media, verifications } from '../db/schema.js';
+import { deliveryExt } from '../processing/delivery.js';
 import type { UrlService } from './urls.service.js';
 
 type MediaRow = typeof media.$inferSelect;
@@ -125,8 +126,25 @@ export interface MediaMarketView {
 }
 
 /**
+ * Decimal places of a published coordinate. 3 places = about 110 m north–south
+ * (less east–west away from the equator): enough to find the street, not the balcony.
+ * The uploader's "use my location" button fills in where the witness was standing,
+ * so channels never see the exact point (review M8).
+ */
+export const PUBLIC_COORDINATE_DECIMALS = 3;
+
+/** Rounds a coordinate for a marketplace view (see PUBLIC_COORDINATE_DECIMALS). */
+export function publicCoordinate(value: number): number {
+  const factor = 10 ** PUBLIC_COORDINATE_DECIMALS;
+  return Math.round(value * factor) / factor;
+}
+
+/**
  * Marketplace view. Never includes the uploader's identity.
  * `paidOrderCount` is the number of PAID orders of this media (any buyer).
+ * Coordinates are rounded (publicCoordinate) unless `exactLocation` is set, which
+ * only admins get. Buyers get the rounded point too: there is no uploader opt-in
+ * to share the exact one yet.
  */
 export function toMediaMarketView(
   row: MediaRow,
@@ -136,18 +154,20 @@ export function toMediaMarketView(
     paidOrderCount: number;
     purchased: MediaMarketView['purchased'];
     includeMetadata?: boolean;
+    exactLocation?: boolean;
     distanceKm?: number;
   },
 ): MediaMarketView {
   const exclusiveTaken = row.exclusiveSold;
+  const exact = extra.exactLocation ?? false;
   return {
     id: row.id,
     type: row.type,
     title: row.title,
     description: row.description,
     category: row.category,
-    latitude: row.latitude,
-    longitude: row.longitude,
+    latitude: exact ? row.latitude : publicCoordinate(row.latitude),
+    longitude: exact ? row.longitude : publicCoordinate(row.longitude),
     locationName: row.locationName,
     capturedAt: row.capturedAt.toISOString(),
     publishedAt: (row.reviewedAt ?? row.createdAt).toISOString(),
@@ -186,4 +206,29 @@ export function distanceKm(lat1: number, lon1: number, lat2: number, lon2: numbe
   const dLon = (lon2 - lon1) * rad;
   const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2;
   return 6371 * 2 * Math.asin(Math.sqrt(a));
+}
+
+/**
+ * The one file name a purchased download gets, used both in the API's JSON
+ * (`GET /orders/:id/download` → fileName) and in the `Content-Disposition` header,
+ * so the two can never disagree (review L8). The title reduced to letters, digits
+ * and dashes (case kept), plus the extension of the file actually delivered
+ * (decided by us from the stored type, never from the client's file name).
+ */
+export function downloadFileName(title: string, ext: string): string {
+  const base =
+    title
+      .normalize('NFKD')
+      .replace(/[^\w\s-]/g, '')
+      .trim()
+      .replace(/[\s_]+/g, '-')
+      .replace(/-+/g, '-')
+      .slice(0, 80)
+      .replace(/^-|-$/g, '') || 'firstframe-media';
+  return /^\.[a-z0-9]{1,5}$/.test(ext) ? `${base}${ext}` : base;
+}
+
+/** `downloadFileName` for a media row: the delivery copy's extension (HEIC is delivered as .jpg). */
+export function deliveryFileName(row: Pick<MediaRow, 'title' | 'originalKey' | 'mimeType'>): string {
+  return downloadFileName(row.title, deliveryExt(row));
 }
