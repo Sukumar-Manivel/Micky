@@ -50,7 +50,7 @@ export function OwnerMediaDetail() {
       <div className="grid gap-6 lg:grid-cols-[1.5fr_1fr]">
         <div className="flex flex-col gap-6">
           {previewable ? (
-            <PreviewPlayer mediaId={media.id} type={media.type} title={media.title} audience="owner" />
+            <PreviewPlayer mediaId={media.id} posterUrl={media.thumbnailUrl} type={media.type} title={media.title} audience="owner" />
           ) : (
             <div className="flex aspect-video items-center justify-center rounded-xl bg-sunken p-6 text-center text-muted">
               {media.status === 'PROCESSING' ? 'The preview will appear here once it is ready.' : 'No preview available.'}

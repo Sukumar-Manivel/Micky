@@ -50,7 +50,7 @@ export function MarketMediaDetail() {
 
       <div className="grid gap-6 lg:grid-cols-[1.6fr_1fr]">
         <div className="flex flex-col gap-6">
-          <PreviewPlayer mediaId={m.id} type={m.type} title={m.title} audience={user.role === 'ADMIN' ? 'admin' : 'buyer'} />
+          <PreviewPlayer mediaId={m.id} posterUrl={m.thumbnailUrl} type={m.type} title={m.title} audience={user.role === 'ADMIN' ? 'admin' : 'buyer'} />
           <header className="flex flex-col gap-2">
             <CategoryBadge category={m.category} />
             <h1 className="font-display text-4xl font-extrabold sm:text-5xl">{m.title}</h1>

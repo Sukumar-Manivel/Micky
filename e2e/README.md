@@ -90,3 +90,12 @@ No uncaught page errors may occur along the way.
   - the admin API session is logged in once per run;
   - the suite stays under both limits.
 - **Refresh-token rotation.** Contexts are never cloned from a saved `storageState`. Reusing a rotated refresh cookie is treated as theft and logs the user out everywhere.
+
+## Regenerating the README screenshots
+
+`shots/` is not part of the test suite. It boots the same stack, creates realistic demo data (four incidents, two newsrooms, a purchase, a payout request and a report), and rewrites every image in `docs/screenshots/` at 1366 px (desktop) and 360 px (mobile):
+
+```bash
+(cd apps/api && npm run build) && (cd apps/web && npm run build)
+cd e2e && npx playwright test --config shots/shots.config.ts
+```

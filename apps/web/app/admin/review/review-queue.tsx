@@ -208,7 +208,7 @@ function ReviewPanel({
         {m.description ? <p className="max-w-prose whitespace-pre-line [overflow-wrap:anywhere]">{m.description}</p> : null}
       </header>
 
-      <PreviewPlayer mediaId={m.id} type={m.type} title={m.title} audience="admin" />
+      <PreviewPlayer mediaId={m.id} posterUrl={m.thumbnailUrl} type={m.type} title={m.title} audience="admin" />
 
       <Panel aria-labelledby="decision-h" className="border-ink">
         <h3 id="decision-h" className="mb-3 text-xl font-bold">

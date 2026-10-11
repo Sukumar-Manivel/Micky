@@ -55,11 +55,14 @@ export function PreviewPlayer({
   type,
   title,
   audience = 'buyer',
+  posterUrl = null,
 }: {
   mediaId: string;
   type: MediaType;
   title: string;
   audience?: PreviewAudience;
+  /** The watermarked thumbnail: shown before playback starts and behind any error. */
+  posterUrl?: string | null;
 }) {
   const [session, setSession] = useState<PreviewSession | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -140,8 +143,19 @@ export function PreviewPlayer({
         // Stop dragging the picture out to the desktop or another tab.
         onDragStart={(e) => e.preventDefault()}
       >
+        {error && posterUrl ? (
+          // Keep showing what the footage looks like; the message sits in a bar over the picture.
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={posterUrl} alt="" draggable={false} className="pointer-events-none absolute inset-0 h-full w-full object-contain" />
+        ) : null}
         {error ? (
-          <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-white">
+          <div
+            className={
+              posterUrl
+                ? 'absolute inset-x-0 bottom-0 flex flex-wrap items-center justify-center gap-3 bg-black/75 p-3 text-center text-sm text-white'
+                : 'flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-white'
+            }
+          >
             <p className="font-semibold">{error}</p>
             {final ? null : (
               <Button
@@ -168,6 +182,7 @@ export function PreviewPlayer({
             ref={videoRef}
             src={session.playlistUrl}
             title={title}
+            posterUrl={posterUrl}
             resumeAt={resumeAt}
             wasPlaying={wasPlaying}
             onExpired={() => void load()}
@@ -223,6 +238,7 @@ interface HlsVideoProps {
   ref: React.Ref<HTMLVideoElement>;
   src: string;
   title: string;
+  posterUrl: string | null;
   resumeAt: React.RefObject<number>;
   wasPlaying: React.RefObject<boolean>;
   onExpired: () => void;
@@ -230,7 +246,7 @@ interface HlsVideoProps {
   onUnplayable: (message: string) => void;
 }
 
-function HlsVideo({ ref, src, title, resumeAt, wasPlaying, onExpired, onUnplayable }: HlsVideoProps) {
+function HlsVideo({ ref, src, title, posterUrl, resumeAt, wasPlaying, onExpired, onUnplayable }: HlsVideoProps) {
   const innerRef = useRef<HTMLVideoElement | null>(null);
   const onExpiredRef = useRef(onExpired);
   const onUnplayableRef = useRef(onUnplayable);
@@ -314,6 +330,7 @@ function HlsVideo({ ref, src, title, resumeAt, wasPlaying, onExpired, onUnplayab
       ref={setRefs}
       aria-label={`Preview of ${title}`}
       className="h-full w-full"
+      poster={posterUrl ?? undefined}
       controls
       playsInline
       // Hide "Download", block picture-in-picture and casting; see the note at the top.
