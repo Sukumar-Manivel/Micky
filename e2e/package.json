@@ -13,11 +13,11 @@
     "stack:down": "tsx scripts/stack.ts down"
   },
   "devDependencies": {
-    "@playwright/test": "1.56.1",
-    "@types/node": "^22.20.5",
+    "@playwright/test": "1.64.0",
+    "@types/node": "^26.6.4",
     "@types/pg": "^8.23.1",
     "pg": "^8.23.1",
     "tsx": "^4.23.15",
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   }
 }
