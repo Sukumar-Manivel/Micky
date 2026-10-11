@@ -2,7 +2,7 @@
 // Each badge pairs colour with text (never colour alone) for colour-blind users.
 
 import { CATEGORY_LABEL, STATUS_LABEL } from '@/lib/format';
-import type { Category, MediaStatus, OrderStatus, PayoutStatus, ReportStatus, RiskLevel } from '@/lib/types';
+import type { Category, ChannelStatus, MediaStatus, OrderStatus, PayoutStatus, ReportStatus, RiskLevel } from '@/lib/types';
 
 type Tone = 'neutral' | 'progress' | 'good' | 'warn' | 'bad' | 'signal';
 
@@ -70,4 +70,10 @@ const reportTone: Record<ReportStatus, Tone> = { OPEN: 'warn', RESOLVED: 'good',
 const reportLabel: Record<ReportStatus, string> = { OPEN: 'Open', RESOLVED: 'Resolved', DISMISSED: 'Dismissed' };
 export function ReportStatusBadge({ status }: { status: ReportStatus }) {
   return <Badge tone={reportTone[status]}>{reportLabel[status]}</Badge>;
+}
+
+const channelTone: Record<ChannelStatus, Tone> = { PENDING: 'warn', APPROVED: 'good', REJECTED: 'bad' };
+const channelLabel: Record<ChannelStatus, string> = { PENDING: 'Awaiting approval', APPROVED: 'Approved', REJECTED: 'Rejected' };
+export function ChannelStatusBadge({ status }: { status: ChannelStatus }) {
+  return <Badge tone={channelTone[status]}>{channelLabel[status]}</Badge>;
 }

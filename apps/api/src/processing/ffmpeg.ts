@@ -78,6 +78,23 @@ export async function ffprobe(filePath: string): Promise<FfprobeOutput> {
   return JSON.parse(out) as FfprobeOutput;
 }
 
+/**
+ * Rotation (degrees) that FFmpeg applies when it decodes the first frame.
+ * For JPEGs this comes from the EXIF orientation flag. FFmpeg (6.1+) rotates
+ * such images upright by itself ("autorotate"), so callers only need the angle
+ * to know the upright width and height, never to rotate again.
+ */
+export async function firstFrameRotation(filePath: string): Promise<number> {
+  const out = await run(
+    'ffprobe',
+    ['-v', 'error', '-select_streams', 'v:0', '-read_intervals', '%+#1', '-show_frames', '-print_format', 'json', filePath],
+    60_000,
+  );
+  const parsed = JSON.parse(out) as { frames?: { side_data_list?: { rotation?: number }[] }[] };
+  const rotation = parsed.frames?.[0]?.side_data_list?.find((d) => typeof d.rotation === 'number')?.rotation;
+  return rotation ?? 0;
+}
+
 // ---------- Watermark ----------
 
 let fontPromise: Promise<string | null> | undefined;

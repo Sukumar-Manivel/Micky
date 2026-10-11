@@ -3,7 +3,7 @@
 // 2. on 401, refreshes the session once (single-flight, see session.ts) and retries once,
 // 3. turns NestJS error bodies into an ApiError with a readable message.
 
-import { API_BASE } from './config';
+import { apiBase } from './config';
 import { createSessionStore } from './session';
 import type {
   AdminPayout,
@@ -80,7 +80,7 @@ async function readJson(res: Response): Promise<unknown> {
 }
 
 async function refreshCall(): Promise<AuthResponse | null> {
-  const res = await fetch(`${API_BASE}/auth/refresh`, { method: 'POST', credentials: 'include' });
+  const res = await fetch(`${apiBase()}/auth/refresh`, { method: 'POST', credentials: 'include' });
   if (res.status === 401 || res.status === 403) return null;
   if (!res.ok) throw new ApiError(res.status, errorMessageFromBody(await readJson(res), res.status));
   return (await res.json()) as AuthResponse;
@@ -112,7 +112,7 @@ async function request<T>(method: string, path: string, opts: RequestOptions = {
   const { body, query, auth = true } = opts;
 
   const send = (token: string | null) =>
-    fetch(`${API_BASE}${path}${toQuery(query)}`, {
+    fetch(`${apiBase()}${path}${toQuery(query)}`, {
       method,
       // Cookies are only needed for /auth/*, but including them everywhere is harmless:
       // the refresh cookie's path is /api/v1/auth, so the browser only sends it there.

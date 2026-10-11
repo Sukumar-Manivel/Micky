@@ -175,3 +175,16 @@ export function Pager({
     </nav>
   );
 }
+
+/** A detail page that could not load (not found, no access, offline): say so and offer a way back. */
+export function LoadFailed({ title, message, backHref, backLabel }: { title: string; message: string; backHref: string; backLabel: string }) {
+  return (
+    <div className="flex flex-col items-start gap-4 py-6">
+      <h1 className="font-display text-4xl font-extrabold">{title}</h1>
+      <Alert>{message}</Alert>
+      <ButtonLink href={backHref} variant="secondary">
+        {backLabel}
+      </ButtonLink>
+    </div>
+  );
+}

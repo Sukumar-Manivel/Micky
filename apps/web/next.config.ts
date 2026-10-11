@@ -1,7 +1,21 @@
 import type { NextConfig } from "next";
 
+// Response headers for every page. The API sets its own; these cover the web app's HTML.
+const securityHeaders = [
+  // Do not let other sites put FirstFrame in a frame (clickjacking on "Buy licence").
+  { key: "X-Frame-Options", value: "DENY" },
+  { key: "X-Content-Type-Options", value: "nosniff" },
+  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+  // Geolocation is used by the upload form and "Near me"; camera and microphone are not.
+  { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(self)" },
+];
+
 const nextConfig: NextConfig = {
-  /* config options here */
+  // `next build` writes a self-contained server to .next/standalone (server.js plus only the
+  // node_modules it needs), which keeps the Docker image small. Copy `public/` and
+  // `.next/static/` next to it; see apps/web/.env.example.
+  output: "standalone",
+  poweredByHeader: false,
   cacheComponents: true,
   partialPrefetching: true,
   turbopack: {
@@ -11,6 +25,9 @@ const nextConfig: NextConfig = {
         as: "*.css",
       },
     },
+  },
+  async headers() {
+    return [{ source: "/:path*", headers: securityHeaders }];
   },
 };
 

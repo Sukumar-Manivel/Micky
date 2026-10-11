@@ -25,6 +25,12 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: LayoutProps<'/'>) {
   return (
     <html lang="en-IN" className="h-full antialiased">
+      <head>
+        {/* Sets window.__FIRSTFRAME_CONFIG__ (the API address) from the container's environment.
+            Deliberately blocking: it is tiny, and it must run before the app's code. See lib/config.ts. */}
+        {/* eslint-disable-next-line @next/next/no-sync-scripts */}
+        <script src="/runtime-config.js" />
+      </head>
       <body className="flex min-h-full flex-col">
         <AuthProvider>
           <ToastProvider>

@@ -7,7 +7,7 @@ export interface ReportView {
   id: string;
   mediaId: string | null;
   reporterEmail: string;
-  reason: string;
+  reason: ReportRow['reason'];
   details: string | null;
   status: ReportRow['status'];
   resolution: string | null;

@@ -29,7 +29,8 @@ export function MediaThumb({
         // eslint-disable-next-line @next/next/no-img-element -- signed, expiring URL; must not go through an image proxy
         <img src={url} alt={alt} loading="lazy" draggable={false} onError={() => setFailed(true)} className="h-full w-full object-cover" />
       ) : (
-        <div className="flex h-full w-full items-center justify-center text-sm font-semibold text-muted">
+        // Top-left, so it never collides with the duration badge in the bottom-right corner.
+        <div className="flex h-full w-full items-start justify-start p-2 text-xs font-semibold text-muted">
           {type === 'VIDEO' ? 'Video' : 'Photo'}
         </div>
       )}

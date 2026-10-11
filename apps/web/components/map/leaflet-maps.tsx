@@ -72,7 +72,8 @@ export interface MapPoint {
   lng: number;
   title: string;
   category: Category;
-  href: string;
+  /** Where the popup's "Open" link goes; omit for a pin with no page (e.g. in admin review). */
+  href?: string;
   detail?: string;
 }
 
@@ -99,8 +100,12 @@ export function PointsMap({ points, className = 'h-[60vh] min-h-80 w-full rounde
             <br />
             {CATEGORY_LABEL[p.category]}
             {p.detail ? ` · ${p.detail}` : ''}
-            <br />
-            <Link href={p.href}>Open</Link>
+            {p.href ? (
+              <>
+                <br />
+                <Link href={p.href}>Open</Link>
+              </>
+            ) : null}
           </Popup>
         </Marker>
       ))}

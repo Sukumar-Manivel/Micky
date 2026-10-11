@@ -25,7 +25,26 @@ import { Button, Skeleton } from './ui';
 /** Refresh this long before the URLs expire, so playback never hits a dead link. */
 const REFRESH_MARGIN_MS = 45_000;
 
-export function PreviewPlayer({ mediaId, type, title }: { mediaId: string; type: MediaType; title: string }) {
+/** Who is watching decides the caption: a buyer, the uploader themselves, or a reviewer. */
+export type PreviewAudience = 'buyer' | 'owner' | 'admin';
+
+const CAPTION: Record<PreviewAudience, string> = {
+  buyer: 'Watermarked preview with your newsroom’s name, at reduced quality. Buy a licence to download the clean original.',
+  owner: 'This is the watermarked preview newsrooms see. Your original file stays private until a newsroom buys a licence.',
+  admin: 'Watermarked review preview. The original file is never sent to the browser here.',
+};
+
+export function PreviewPlayer({
+  mediaId,
+  type,
+  title,
+  audience = 'buyer',
+}: {
+  mediaId: string;
+  type: MediaType;
+  title: string;
+  audience?: PreviewAudience;
+}) {
   const [session, setSession] = useState<PreviewSession | null>(null);
   const [error, setError] = useState<string | null>(null);
   const resumeAt = useRef(0);
@@ -67,6 +86,8 @@ export function PreviewPlayer({ mediaId, type, title }: { mediaId: string; type:
         className="relative aspect-video w-full select-none overflow-hidden rounded-xl bg-black"
         // Block the right-click / long-press menu ("Save video as…", "Save image as…").
         onContextMenu={(e) => e.preventDefault()}
+        // Stop dragging the picture out to the desktop or another tab.
+        onDragStart={(e) => e.preventDefault()}
       >
         {error ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-white">
@@ -97,10 +118,21 @@ export function PreviewPlayer({ mediaId, type, title }: { mediaId: string; type:
           />
         )}
         {session && !error ? <WatermarkOverlay text={session.watermarkText} /> : null}
+        <span className="pointer-events-none absolute left-2 top-2 rounded bg-black/60 px-2 py-0.5 text-xs font-bold uppercase tracking-wide text-white">
+          Preview
+        </span>
       </div>
-      <figcaption className="text-sm text-muted">
-        Preview only — low resolution, watermarked. Buy a licence for the original.
-        {type === 'VIDEO' ? ' Video previews are at most 30 seconds.' : ''}
+      <figcaption className="flex flex-col gap-1 text-sm text-muted">
+        <span>
+          {CAPTION[audience]}
+          {type === 'VIDEO' ? ' Video previews are at most 30 seconds.' : ''}
+        </span>
+        {audience === 'buyer' ? (
+          <span className="text-xs">
+            Saving is switched off in this player, but no website can stop a screen recording. That is why every preview
+            carries your organisation’s name and the date.
+          </span>
+        ) : null}
       </figcaption>
     </figure>
   );

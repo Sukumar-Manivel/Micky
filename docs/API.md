@@ -26,6 +26,13 @@ interface UserView {
   uploader: { upiId: string | null } | null;
 }
 
+type ReportReason = 'PRIVACY' | 'COPYRIGHT' | 'FAKE' | 'GRAPHIC' | 'OTHER';
+
+interface Report {
+  id: string; mediaId: string | null; reporterEmail: string; reason: ReportReason; details: string | null;
+  status: 'OPEN' | 'RESOLVED' | 'DISMISSED'; resolution: string | null; createdAt: string; resolvedAt: string | null;
+}
+
 interface Signal { code: string; level: 'info' | 'warning' | 'danger' | 'positive'; message: string }
 
 interface VerificationView {
@@ -111,7 +118,7 @@ The refresh token lives only in the httpOnly cookie `ff_refresh` (path `/api/v1/
 | GET | `/me/media` | UPLOADER | `?page&pageSize&status?` → `Paginated<MediaOwnerView>`, newest first |
 | GET | `/me/media/:id` | UPLOADER (owner) | → `MediaOwnerView` |
 | PATCH | `/me/media/:id` | UPLOADER (owner) | `{ title?, description?, priceNonExclusive?, priceExclusive? }` (paise; only while not sold) → `MediaOwnerView` |
-| DELETE | `/me/media/:id` | UPLOADER (owner) | → **204**. Sets status `REMOVED`. 409 if it has any paid order |
+| DELETE | `/me/media/:id` | UPLOADER (owner) | → **204**. Sets status `REMOVED` (idempotent: deleting removed media also returns 204). 409 if it has any paid order |
 
 **Upload fields:**
 
@@ -128,7 +135,7 @@ The refresh token lives only in the httpOnly cookie `ff_refresh` (path `/api/v1/
 | `priceNonExclusive`, `priceExclusive` | paise, optional | Defaults by type. Allowed range ₹100–₹1,00,000; exclusive ≥ non-exclusive |
 | `rightsConfirmed` | `'true'`, required | Uploader confirms they shot it, it is real, and they accept the uploader licence |
 
-Duplicate check: if the same file checksum was already uploaded by anyone, reject with 409 `This file has already been uploaded`.
+Duplicate check: if the same file checksum was already uploaded by anyone, reject with 409 `This file has already been uploaded`. Uploads that ended in `FAILED` are excluded, so an uploader can retry the same file after a processing failure.
 
 ## Marketplace (MarketModule)
 

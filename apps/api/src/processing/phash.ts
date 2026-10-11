@@ -14,6 +14,19 @@ export function isValidPhash(hash: string): boolean {
 }
 
 /**
+ * A hash with almost all bits 0 (or all 1) comes from a frame with no detail:
+ * a black screen, a lens cap, a flat sky. Every black frame in the world has
+ * the same pHash, so such hashes would flag unrelated uploads as duplicates.
+ * The duplicate search ignores them.
+ */
+export function isInformativePhash(hash: string): boolean {
+  if (!isValidPhash(hash)) return false;
+  let ones = 0;
+  for (let v = BigInt(`0x${hash}`); v > 0n; v >>= 1n) ones += Number(v & 1n);
+  return ones >= 4 && ones <= 60;
+}
+
+/**
  * Hamming distance between two 64-bit hashes: the number of bits that differ.
  * Returns null if either hash is not 16 hex characters.
  */

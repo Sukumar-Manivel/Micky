@@ -1,0 +1,16 @@
+# Keep the build context small and secrets out of images.
+node_modules
+dist
+coverage
+tmp
+storage
+test
+*.log
+.env
+.env.*
+!.env.example
+.git
+Dockerfile
+.dockerignore
+README.md
+*.tsbuildinfo

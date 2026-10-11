@@ -5,8 +5,12 @@ import type { MetadataRoute } from 'next';
 // deliberately no service worker caching API data: stale prices or availability would be wrong.
 export default function manifest(): MetadataRoute.Manifest {
   return {
+    // A stable identity for the installed app, so changing start_url later does not create a second app.
+    id: '/',
     name: 'FirstFrame',
     short_name: 'FirstFrame',
+    lang: 'en-IN',
+    dir: 'ltr',
     description: 'Upload verified eyewitness footage. Newsrooms license it, you get paid.',
     start_url: '/upload',
     scope: '/',

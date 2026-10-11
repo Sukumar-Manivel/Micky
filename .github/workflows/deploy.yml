@@ -1,0 +1,238 @@
+# Continuous delivery: on every push to main (or by hand), run CI, build
+# multi-arch images (amd64 + arm64) natively, push them to GitHub Container
+# Registry (ghcr.io), then SSH to the Oracle VM and roll the new version out.
+#
+# Repository settings this needs (Settings -> Secrets and variables -> Actions):
+#   Variables:  DEPLOY_ENABLED   "true" once the VM is ready (until then: build + push only)
+#               PUBLIC_API_URL   optional, e.g. https://api.firstframe.in: used for the
+#                                post-deploy health check (the web container gets its API
+#                                address at runtime from API_DOMAIN in the VM's .env)
+#               WEB_DOMAIN       optional, shown as the environment URL
+#               ARM64_RUNNER     optional, defaults to ubuntu-24.04-arm
+#   Secrets (environment "production"):
+#               SSH_HOST, SSH_USER, SSH_PRIVATE_KEY, optional SSH_PORT, SSH_KNOWN_HOSTS
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref_tag:
+        description: "Deploy an already-built image tag instead (commit SHA). Leave empty to build HEAD."
+        required: false
+        default: ""
+
+# Nothing by default; each job asks for exactly what it needs.
+permissions: {}
+
+# One deployment at a time, and never cancel one halfway.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    if: inputs.ref_tag == ''
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    name: Build ${{ matrix.image }} (${{ matrix.arch }})
+    needs: ci
+    if: inputs.ref_tag == ''
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    # Native runners for each architecture: emulating arm64 with QEMU is 5-10x slower
+    # (painful for PyTorch). Arm64 hosted runners are free for public repositories.
+    runs-on: ${{ matrix.arch == 'arm64' && (vars.ARM64_RUNNER || 'ubuntu-24.04-arm') || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        image: [api, web, verifier]
+        arch: [amd64, arm64]
+        include:
+          - image: api
+            context: apps/api
+          - image: web
+            context: apps/web
+          - image: verifier
+            context: services/verifier
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Image name (ghcr.io needs lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/firstframe-${{ matrix.image }}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
+          provenance: false
+
+      - name: Save digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.image }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: Publish ${{ matrix.image }} (multi-arch)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        image: [api, web, verifier]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-${{ matrix.image }}-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the amd64+arm64 manifest, tagged with the commit SHA and "latest"
+        working-directory: /tmp/digests
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/firstframe-${{ matrix.image }}"
+          # shellcheck disable=SC2046
+          docker buildx imagetools create -t "$IMAGE:$GITHUB_SHA" -t "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA"
+
+  deploy:
+    name: Deploy to the VM
+    needs: [manifest]
+    # Runs after a build, or alone for a manual redeploy/rollback of an existing tag.
+    if: >-
+      always() && vars.DEPLOY_ENABLED == 'true' &&
+      (needs.manifest.result == 'success' || (inputs.ref_tag != '' && needs.manifest.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: ${{ vars.WEB_DOMAIN && format('https://{0}', vars.WEB_DOMAIN) || '' }}
+    permissions:
+      contents: read
+      packages: read # lets the VM pull private images with this job's short-lived token
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+      TAG: ${{ inputs.ref_tag || github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            infra
+            scripts
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          # TAG is interpolated into a remote shell command below: allow only safe characters.
+          if ! printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9._-]{1,128}$'; then
+            echo "::error::Invalid image tag: $TAG"; exit 1
+          fi
+          if [ -z "$SSH_HOST" ] || [ -z "$SSH_USER" ] || [ -z "$SSH_PRIVATE_KEY" ]; then
+            echo "::error::Set SSH_HOST, SSH_USER and SSH_PRIVATE_KEY in the production environment secrets"; exit 1
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "::warning::SSH_KNOWN_HOSTS is not set; trusting the host key seen now (set it to prevent MITM)"
+            ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" > ~/.ssh/known_hosts
+          fi
+          {
+            echo "Host vm"
+            echo "  HostName $SSH_HOST"
+            echo "  User $SSH_USER"
+            echo "  Port $SSH_PORT"
+            echo "  IdentityFile ~/.ssh/id_deploy"
+            echo "  IdentitiesOnly yes"
+            echo "  StrictHostKeyChecking yes"
+            echo "  ServerAliveInterval 30"
+          } > ~/.ssh/config
+
+      - name: Copy compose file, Caddyfile and scripts
+        run: |
+          ssh vm 'mkdir -p /opt/firstframe/scripts'
+          scp infra/docker-compose.prod.yml vm:/opt/firstframe/docker-compose.yml
+          scp infra/Caddyfile infra/.env.prod.example vm:/opt/firstframe/
+          scp scripts/*.sh vm:/opt/firstframe/scripts/
+          ssh vm 'chmod +x /opt/firstframe/scripts/*.sh'
+
+      - name: Pull, migrate and restart
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          # The token expires when this job ends; logging out removes it from the VM anyway.
+          # $GHCR_USER (a GitHub username) and $TAG (validated above) expand here, on purpose.
+          # shellcheck disable=SC2029
+          printf '%s' "$GHCR_TOKEN" | ssh vm "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+          status=0
+          # shellcheck disable=SC2029
+          ssh vm "/opt/firstframe/scripts/deploy.sh '$TAG'" || status=$?
+          ssh vm 'docker logout ghcr.io' || true
+          exit $status
+
+      - name: Check the public health endpoint
+        if: vars.PUBLIC_API_URL != ''
+        env:
+          PUBLIC_API_URL: ${{ vars.PUBLIC_API_URL }}
+        run: |
+          for _ in $(seq 1 10); do
+            if curl -fsS --max-time 10 "$PUBLIC_API_URL/api/v1/health"; then exit 0; fi
+            sleep 6
+          done
+          echo "::error::$PUBLIC_API_URL/api/v1/health did not answer 200"; exit 1
+
+      - name: Remove the SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_deploy

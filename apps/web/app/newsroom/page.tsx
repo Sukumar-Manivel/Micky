@@ -5,6 +5,9 @@ import { LiveFeed } from './live-feed';
 
 export const metadata: Metadata = { title: 'Live feed' };
 
+// Rendered only after <RequireRole> in the layout restores the session in the browser; see the layout's note.
+export const instant = false;
+
 export default function NewsroomPage() {
   // LiveFeed reads its filters from the URL, so it renders inside Suspense.
   return (

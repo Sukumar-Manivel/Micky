@@ -1,7 +1,7 @@
 // Display helpers for dates, labels and durations. Times are shown in India Standard Time,
 // because both witnesses and newsrooms are in India, whatever the device clock says.
 
-import type { Category, LicenseType, MediaStatus } from './types';
+import type { Category, LicenseType, MediaStatus, ReportReason } from './types';
 
 const IST = 'Asia/Kolkata';
 
@@ -74,3 +74,11 @@ export function toLocalInputValue(date: Date): string {
 export function formatKm(km: number): string {
   return km < 1 ? `${Math.round(km * 1000)} m away` : `${km.toFixed(km < 10 ? 1 : 0)} km away`;
 }
+
+export const REPORT_REASON_LABEL: Record<ReportReason, string> = {
+  PRIVACY: 'Privacy',
+  COPYRIGHT: 'Copyright',
+  FAKE: 'Fake or misleading',
+  GRAPHIC: 'Graphic content',
+  OTHER: 'Other',
+};

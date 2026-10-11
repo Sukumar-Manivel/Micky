@@ -8,7 +8,7 @@ import { PointsMap, type MapPoint } from '@/components/maps';
 import { MediaCard } from '@/components/market-cards';
 import { PageSkeleton } from '@/components/require-role';
 import { useToast } from '@/components/toast';
-import { Alert, EmptyState } from '@/components/ui';
+import { EmptyState, LoadFailed } from '@/components/ui';
 import { marketApi } from '@/lib/api';
 import { formatDateTime, timeAgo } from '@/lib/format';
 import { useApi } from '@/lib/use-api';
@@ -48,7 +48,8 @@ export function IncidentDetailView() {
   );
 
   if (loading) return <PageSkeleton />;
-  if (error && !data) return <Alert>{error}</Alert>;
+  if (error && !data)
+    return <LoadFailed title="Incident not available" message={error} backHref="/newsroom" backLabel="Back to the live feed" />;
   if (!data) return null;
 
   return (

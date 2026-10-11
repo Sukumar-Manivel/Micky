@@ -1,0 +1,223 @@
+# FirstFrame: PRODUCTION stack for one Oracle Cloud Always Free ARM VM
+# (2 OCPU / 12 GB RAM / 200 GB disk). See docs/DEPLOYMENT.md.
+#
+# On the VM this file is copied to /opt/firstframe/docker-compose.yml next to
+# Caddyfile and .env (from .env.prod.example). Then:
+#   docker compose pull && docker compose up -d          # start / update
+#   docker compose run --rm seed                         # create the admin once
+#   docker compose logs -f api worker                    # watch logs
+#
+# Only Caddy publishes ports (80/443). PostgreSQL, Redis and the verifier sit on
+# an `internal` network with no route to the internet and no published ports.
+#
+# Memory budget (limits; the kernel keeps the rest for page cache + the OS):
+#   postgres 1.5G · redis 384M · verifier 2.5G · api 1G · worker 2G · web 768M · caddy 256M
+#   = ~8.4 GB of 12 GB. Raise/lower here if `docker stats` shows otherwise.
+
+name: firstframe
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m" # rotate logs so they can't fill the disk
+    max-file: "3"
+
+x-api-common: &api-common
+  image: ${IMAGE_PREFIX:?set IMAGE_PREFIX in .env}/firstframe-api:${IMAGE_TAG:-latest}
+  env_file: .env
+  environment: &api-env
+    NODE_ENV: production
+    PORT: "4000"
+    PUBLIC_API_URL: https://${API_DOMAIN}
+    WEB_URL: https://${WEB_DOMAIN}
+    CORS_ORIGINS: https://${WEB_DOMAIN}
+    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    REDIS_URL: redis://redis:6379
+    VERIFIER_URL: http://verifier:8000
+    STORAGE_LOCAL_DIR: /data/storage
+    UPLOAD_TMP_DIR: /data/tmp/uploads
+  logging: *logging
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      WEB_DOMAIN: ${WEB_DOMAIN:?set WEB_DOMAIN in .env}
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # TLS certificates: keep this volume, or you hit Let's Encrypt rate limits
+      - caddy_config:/config
+    networks: [edge]
+    depends_on: [api, web]
+    deploy:
+      resources:
+        limits: { memory: 256M }
+    logging: *logging
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+    # Modest tuning for a 1.5 GB container on a 2-core VM.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=60
+      - -c
+      - wal_compression=on
+    shm_size: 256m
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits: { memory: 1536M }
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # AOF persistence so queued jobs survive restarts; noeviction because BullMQ
+    # must never lose jobs silently (it errors instead when memory is full).
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits: { memory: 384M }
+    logging: *logging
+
+  verifier:
+    image: ${IMAGE_PREFIX}/firstframe-verifier:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?set INTERNAL_TOKEN}
+      AI_MODEL_ENABLED: ${AI_MODEL_ENABLED:-true}
+      TORCH_THREADS: "2"
+      LOG_LEVEL: INFO
+    networks: [backend]
+    deploy:
+      resources:
+        limits: { memory: 2560M, cpus: "1.5" }
+    logging: *logging
+
+  # One-shot: applies pending migrations and exits. `up` runs it before api/worker.
+  migrate:
+    <<: *api-common
+    command: ["node", "dist/db/migrate.js"]
+    restart: "no"
+    networks: [backend]
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Run once after the first deploy: docker compose run --rm seed
+  seed:
+    <<: *api-common
+    command: ["node", "dist/db/seed.js"]
+    restart: "no"
+    profiles: ["tools"]
+    networks: [backend]
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *api-common
+    restart: unless-stopped
+    environment:
+      <<: *api-env
+      NODE_OPTIONS: --enable-source-maps --max-old-space-size=768
+    volumes:
+      - mediadata:/data
+    networks: [edge, backend] # edge: Caddy + internet (R2, Razorpay); backend: db, redis
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits: { memory: 1024M }
+
+  worker:
+    <<: *api-common
+    command: ["node", "dist/worker.js"]
+    restart: unless-stopped
+    environment:
+      <<: *api-env
+      NODE_OPTIONS: --enable-source-maps --max-old-space-size=512
+    volumes:
+      - mediadata:/data
+    networks: [edge, backend]
+    healthcheck:
+      disable: true # the image's healthcheck probes the HTTP API
+    stop_grace_period: 60s # let a running ffmpeg job finish or be re-queued cleanly
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      verifier:
+        condition: service_started
+    deploy:
+      resources:
+        limits: { memory: 2048M, cpus: "1.5" }
+
+  web:
+    image: ${IMAGE_PREFIX}/firstframe-web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      # Read at request time by /runtime-config.js, so one image works for any domain.
+      PUBLIC_API_URL: https://${API_DOMAIN}
+      NODE_OPTIONS: --max-old-space-size=512
+    networks: [edge]
+    deploy:
+      resources:
+        limits: { memory: 768M }
+    logging: *logging
+
+networks:
+  edge: {}
+  backend:
+    internal: true # no internet access, nothing published
+
+volumes:
+  pgdata:
+  redisdata:
+  mediadata: # originals + previews (STORAGE_DRIVER=local) + upload temp files
+  caddy_data:
+  caddy_config:

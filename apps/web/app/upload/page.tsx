@@ -3,6 +3,9 @@ import { UploadForm } from './upload-form';
 
 export const metadata: Metadata = { title: 'Upload footage' };
 
+// Rendered only after <RequireRole> in the layout restores the session in the browser; see the layout's note.
+export const instant = false;
+
 export default function UploadPage() {
   return (
     <div className="mx-auto w-full max-w-2xl px-4 py-8">

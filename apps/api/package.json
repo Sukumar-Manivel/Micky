@@ -11,7 +11,7 @@
     "start": "node dist/main.js",
     "start:worker": "node dist/worker.js",
     "dev": "nest start --watch",
-    "dev:worker": "tsx watch src/worker.ts",
+    "dev:worker": "nest start --watch --entryFile worker",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "oxlint src/ test/",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",

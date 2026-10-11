@@ -13,7 +13,7 @@
 import { useEffect, useEffectEvent, useState } from 'react';
 import type { Socket } from 'socket.io-client';
 import { session } from './api';
-import { API_URL } from './config';
+import { apiUrl } from './config';
 import type { IncidentUpdatedEvent, MediaApprovedEvent } from './types';
 
 export type LiveStatus = 'connecting' | 'live' | 'offline';
@@ -38,7 +38,7 @@ export function useLive(enabled: boolean, handlers: Handlers): LiveStatus {
       // Load the client library only on pages that use live alerts.
       const { io } = await import('socket.io-client');
       if (disposed) return;
-      socket = io(`${API_URL}/live`, {
+      socket = io(`${apiUrl()}/live`, {
         path: '/socket.io',
         auth: (cb) => cb({ token: session.getToken() }),
         withCredentials: true,

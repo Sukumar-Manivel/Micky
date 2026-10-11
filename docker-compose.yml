@@ -1,0 +1,158 @@
+# FirstFrame: full stack for LOCAL development / demos.
+#
+#   docker compose up --build            # build images and start everything
+#   docker compose run --rm seed         # create the admin (admin@firstframe.local)
+#   open http://localhost:3000           # web     (API: http://localhost:4000/api/v1/health)
+#   docker compose down                  # stop    (add -v to also delete the data volumes)
+#
+# Production uses infra/docker-compose.prod.yml instead (Caddy, prebuilt images,
+# memory limits, real secrets). Nothing here is safe for the internet: the
+# secrets below are fixed development values and payments are mocked.
+#
+# Host ports can be changed without editing this file, e.g.
+#   WEB_PORT=3100 API_PORT=4100 docker compose up --build
+# The web app reads the API address at runtime (PUBLIC_API_URL), so it follows API_PORT.
+# PostgreSQL and Redis are NOT published to the host (a native Postgres/Redis on
+# 5432/6379 keeps working). Set PG_PORT / REDIS_PORT and uncomment `ports` to reach them.
+
+name: firstframe
+
+x-api-env: &api-env
+  NODE_ENV: development
+  PORT: "4000"
+  PUBLIC_API_URL: http://localhost:${API_PORT:-4000}
+  WEB_URL: http://localhost:${WEB_PORT:-3000}
+  CORS_ORIGINS: http://localhost:${WEB_PORT:-3000}
+  DATABASE_URL: postgresql://firstframe:firstframe@postgres:5432/firstframe
+  REDIS_URL: redis://redis:6379
+  # Development-only secrets (the API refuses short/missing secrets when NODE_ENV=production).
+  JWT_ACCESS_SECRET: dev-only-jwt-secret-change-me-0123456789abcdef
+  SIGNING_SECRET: dev-only-signing-secret-change-me-0123456789ab
+  INTERNAL_TOKEN: dev-only-internal-token-change-me-0123456789
+  STORAGE_DRIVER: local
+  STORAGE_LOCAL_DIR: /data/storage
+  UPLOAD_TMP_DIR: /data/tmp/uploads
+  VERIFIER_URL: http://verifier:8000
+  PAYMENTS_PROVIDER: mock
+  PLATFORM_FEE_PERCENT: "30"
+  WORKER_CONCURRENCY: "1"
+  ADMIN_EMAIL: admin@firstframe.local
+  ADMIN_PASSWORD: change-this-admin-password
+
+x-api-image: &api-image
+  image: firstframe-api:local
+  build:
+    context: ./apps/api
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: firstframe
+      POSTGRES_PASSWORD: firstframe
+      POSTGRES_DB: firstframe
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # ports: ["${PG_PORT:-55432}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U firstframe -d firstframe"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # BullMQ needs noeviction: Redis must never silently drop queued jobs.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    # ports: ["${REDIS_PORT:-56379}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  verifier:
+    image: firstframe-verifier:local
+    build:
+      context: ./services/verifier
+      args:
+        # Small image without the ~345 MB model. Set to true to test the real detector.
+        PRELOAD_MODEL: "false"
+    environment:
+      INTERNAL_TOKEN: dev-only-internal-token-change-me-0123456789
+      AI_MODEL_ENABLED: "false"
+      LOG_LEVEL: INFO
+
+  # One-shot: applies database migrations, then exits. api and worker wait for it.
+  migrate:
+    <<: *api-image
+    command: ["node", "dist/db/migrate.js"]
+    environment: *api-env
+    restart: "no"
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Not started by `up`. Run on demand: docker compose run --rm seed
+  seed:
+    <<: *api-image
+    command: ["node", "dist/db/seed.js"]
+    environment: *api-env
+    restart: "no"
+    profiles: ["tools"]
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  api:
+    <<: *api-image
+    environment: *api-env
+    ports:
+      - "${API_PORT:-4000}:4000"
+    volumes:
+      - mediadata:/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    <<: *api-image
+    command: ["node", "dist/worker.js"]
+    environment: *api-env
+    volumes:
+      - mediadata:/data # same volume: the worker reads originals the api stored
+    healthcheck:
+      disable: true # the image's healthcheck probes the HTTP API, which the worker doesn't serve
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      verifier:
+        condition: service_started
+
+  web:
+    image: firstframe-web:local
+    build:
+      context: ./apps/web
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:${API_PORT:-4000} # build-time fallback
+    environment:
+      PUBLIC_API_URL: http://localhost:${API_PORT:-4000} # runtime value (wins)
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  redisdata:
+  mediadata:

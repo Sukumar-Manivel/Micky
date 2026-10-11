@@ -14,7 +14,7 @@ export function IncidentMap() {
   const [filters, setFilters] = useFeedFilters();
   const toast = useToast();
   const near = filters.lat !== undefined && filters.lng !== undefined;
-  const { data, error, reload } = useApi(`map ${JSON.stringify(filters)}`, () =>
+  const { data, error, loading, reload } = useApi(`map ${JSON.stringify(filters)}`, () =>
     marketApi.incidents({
       sort: 'trending',
       category: filters.category,
@@ -66,11 +66,15 @@ export function IncidentMap() {
       <div className="mt-6">
         {error ? <Alert>{error}</Alert> : null}
         <PointsMap points={points} />
-        {data ? (
-          <p className="mt-2 text-sm text-muted" role="status">
-            {data.items.length === 0 ? 'No incidents match these filters.' : `${data.items.length} incidents shown.`}
-          </p>
-        ) : null}
+        <p className="mt-2 text-sm text-muted" role="status">
+          {loading
+            ? 'Loading incidents…'
+            : data
+              ? data.items.length === 0
+                ? 'No incidents match these filters. Widen the time range or remove the category.'
+                : `${data.items.length} ${data.items.length === 1 ? 'incident' : 'incidents'} shown.`
+              : null}
+        </p>
       </div>
     </>
   );

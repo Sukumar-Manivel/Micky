@@ -1,4 +1,4 @@
-import { hammingDistance, isValidPhash, minDistance } from './phash.js';
+import { hammingDistance, isInformativePhash, isValidPhash, minDistance } from './phash.js';
 
 describe('hammingDistance', () => {
   it('is 0 for identical hashes', () => {
@@ -33,5 +33,22 @@ describe('minDistance', () => {
   it('returns null when there is nothing to compare', () => {
     expect(minDistance([], ['0000000000000000'])).toBeNull();
     expect(minDistance(['bad'], ['0000000000000000'])).toBeNull();
+  });
+});
+
+describe('isInformativePhash', () => {
+  it('accepts an ordinary hash', () => {
+    expect(isInformativePhash('a1b2c3d4e5f60718')).toBe(true);
+  });
+
+  it('rejects hashes of flat frames (almost all bits equal)', () => {
+    expect(isInformativePhash('0000000000000000')).toBe(false); // black frame
+    expect(isInformativePhash('8000000000000001')).toBe(false); // 2 bits set
+    expect(isInformativePhash('ffffffffffffffff')).toBe(false);
+    expect(isInformativePhash('fffffffffffffff0')).toBe(true); // 60 bits set: borderline but kept
+  });
+
+  it('rejects malformed hashes', () => {
+    expect(isInformativePhash('nope')).toBe(false);
   });
 });

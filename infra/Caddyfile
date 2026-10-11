@@ -1,0 +1,73 @@
+# FirstFrame reverse proxy. Caddy gets and renews Let's Encrypt certificates
+# for both domains automatically (ports 80 and 443 must be reachable).
+# WEB_DOMAIN, API_DOMAIN and ACME_EMAIL come from the container environment.
+#
+# Cloudflare: keep API_DOMAIN "DNS only" (grey cloud). Cloudflare's free plan
+# rejects request bodies over 100 MB (video uploads go up to 500 MB) and its
+# terms restrict serving video through the free CDN. WEB_DOMAIN can be
+# "Proxied" (orange cloud) with SSL/TLS mode "Full (strict)", after Caddy has
+# issued its first certificate. See docs/DEPLOYMENT.md.
+{
+	email {$ACME_EMAIL}
+	# Uncomment while testing to avoid Let's Encrypt production rate limits:
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+	servers {
+		# Uploads on slow mobile networks can take a long time; don't cut them off.
+		timeouts {
+			read_header 30s
+			idle 5m
+		}
+	}
+}
+
+# "?" = set only if the app didn't already (helmet on the API and
+# next.config.ts headers on the web app set most of these themselves).
+# HSTS: helmet sets it on the API; the web block adds it below.
+(security_headers) {
+	header {
+		?X-Content-Type-Options "nosniff"
+		?Referrer-Policy "strict-origin-when-cross-origin"
+		?X-Frame-Options "DENY"
+		-Server
+	}
+}
+
+# ---------- Web app (Next.js) ----------
+{$WEB_DOMAIN} {
+	import security_headers
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	encode zstd gzip
+	reverse_proxy web:3000
+}
+
+# ---------- API (NestJS) ----------
+{$API_DOMAIN} {
+	import security_headers
+
+	# Uploads: videos up to 500 MB plus multipart overhead. The API enforces the
+	# exact per-type limits; this only stops absurd bodies at the edge.
+	request_body {
+		max_size 520MB
+	}
+
+	# Live updates (Socket.IO). reverse_proxy upgrades WebSocket connections
+	# automatically; this block just keeps them out of compression and makes
+	# long-polling responses flush immediately.
+	@socketio path /socket.io/*
+	handle @socketio {
+		reverse_proxy api:4000 {
+			flush_interval -1
+			stream_close_delay 5m # don't drop every live socket on each config reload
+		}
+	}
+
+	handle {
+		# Compress JSON; video segments (video/mp2t) are not in Caddy's default list.
+		encode zstd gzip
+		reverse_proxy api:4000 {
+			# The API trusts exactly one proxy hop (app.set('trust proxy', 1)), so
+			# it reads the client IP from the X-Forwarded-For header Caddy sets here.
+			header_up X-Real-IP {remote_host}
+		}
+	}
+}

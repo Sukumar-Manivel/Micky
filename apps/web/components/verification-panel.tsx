@@ -99,6 +99,8 @@ export function VerificationPanel({
             <Link href={duplicateHref(verification.duplicateOfId)} className="underline">
               Open the earlier upload
             </Link>
+          ) : showMetadata ? (
+            <span className="block font-mono text-xs font-normal [overflow-wrap:anywhere]">Earlier upload ID: {verification.duplicateOfId}</span>
           ) : null}
         </p>
       ) : null}

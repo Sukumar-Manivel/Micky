@@ -14,6 +14,7 @@ coverage/
 .env
 .env.*
 !.env.example
+!.env.prod.example
 
 # Logs
 logs/
@@ -46,3 +47,12 @@ pgdata/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local media storage and test output from the API
+apps/api/storage/
+apps/api/tmp/
+storage/
+tmp/
+
+# Redis snapshot from a local redis-server
+dump.rdb

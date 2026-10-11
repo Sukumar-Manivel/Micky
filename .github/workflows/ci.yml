@@ -1,0 +1,190 @@
+# Continuous integration: lint, typecheck, test and build every part of FirstFrame.
+# Runs on pull requests and on pushes to branches other than main. Pushes to
+# main run it through deploy.yml (workflow_call), so main is tested exactly once
+# and nothing is deployed unless this passes.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_call:
+  workflow_dispatch:
+
+# Least privilege: CI only needs to read the code.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs on PR branches; never cancel a run that deploy.yml started.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "22"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  api:
+    name: API (lint, typecheck, unit + e2e tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/api
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: firstframe
+          POSTGRES_PASSWORD: firstframe
+          POSTGRES_DB: firstframe_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U firstframe -d firstframe_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/api/package-lock.json
+      - name: Install ffmpeg (media processing tests)
+        working-directory: .
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg fonts-dejavu-core fontconfig
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - name: E2E tests
+        run: npm run test:e2e
+        env:
+          TEST_DATABASE_URL: postgresql://firstframe:firstframe@localhost:5432/firstframe_test
+          TEST_REDIS_URL: redis://localhost:6379/1
+      - name: Build
+        run: npm run build
+
+  web:
+    name: Web (lint, typecheck, tests, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/web
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      NEXT_PUBLIC_API_URL: https://api.example.com
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - name: Cache Next.js build cache
+        uses: actions/cache@v4
+        with:
+          path: apps/web/.next/cache
+          key: next-${{ runner.os }}-${{ hashFiles('apps/web/package-lock.json') }}-${{ hashFiles('apps/web/**/*.ts', 'apps/web/**/*.tsx', 'apps/web/**/*.css') }}
+          restore-keys: next-${{ runner.os }}-${{ hashFiles('apps/web/package-lock.json') }}-
+      - run: npm run build
+
+  verifier:
+    name: Verifier (ruff, pytest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: services/verifier
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: services/verifier/requirements*.txt
+      # requirements-dev.txt has no torch: the tests don't need the AI model.
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: python -m pytest
+
+  infra:
+    name: Infra (compose, shellcheck)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Validate compose files
+        run: |
+          docker compose config --quiet
+          mkdir -p /tmp/vm
+          cp infra/docker-compose.prod.yml /tmp/vm/docker-compose.yml
+          cp infra/Caddyfile /tmp/vm/Caddyfile
+          sed -e 's/CHANGE_ME/placeholder/g' infra/.env.prod.example > /tmp/vm/.env
+          docker compose --project-directory /tmp/vm -f /tmp/vm/docker-compose.yml config --quiet
+      - name: Validate Caddyfile
+        run: |
+          docker run --rm -v "$PWD/infra/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            -e WEB_DOMAIN=example.com -e API_DOMAIN=api.example.com -e ACME_EMAIL=ci@example.com \
+            caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: shellcheck
+        run: shellcheck -x scripts/*.sh # preinstalled on GitHub's Ubuntu runners
+
+  docker:
+    name: Docker build (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: api
+            context: apps/api
+            build-args: ""
+          - image: web
+            context: apps/web
+            build-args: ""
+          - image: verifier
+            context: services/verifier
+            build-args: PRELOAD_MODEL=false # CI only checks that it builds
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (linux/amd64, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          build-args: ${{ matrix.build-args }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: firstframe-${{ matrix.image }}:ci
+          cache-from: type=gha,scope=ci-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=ci-${{ matrix.image }}
+      - name: Smoke test the API image tools
+        if: matrix.image == 'api'
+        run: |
+          docker run --rm --entrypoint sh firstframe-api:ci -c \
+            'ffmpeg -hide_banner -filters | grep -q drawtext && ffprobe -version >/dev/null && fc-match -f "%{file}\n" "DejaVu Sans:bold" && test -f dist/worker.js && test -f dist/db/migrate.js && ls drizzle >/dev/null && id -u'

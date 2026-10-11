@@ -7,7 +7,7 @@
 // answers 401 we refresh the session (sharing the single-flight refresh with fetch calls) and
 // send the file once more.
 
-import { API_BASE } from './config';
+import { apiBase } from './config';
 import { ApiError, errorMessageFromBody, session } from './api';
 import type { MediaOwnerView, UploadFields } from './types';
 
@@ -53,7 +53,7 @@ export function uploadMedia(
     new Promise<{ status: number; body: unknown }>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       current = xhr;
-      xhr.open('POST', `${API_BASE}/media`);
+      xhr.open('POST', `${apiBase()}/media`);
       xhr.withCredentials = true;
       if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
       // Do NOT set Content-Type: the browser adds multipart/form-data with the boundary.
