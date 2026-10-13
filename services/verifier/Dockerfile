@@ -11,7 +11,7 @@
 # (~150 MB instead of ~1 GB): C2PA and perceptual hashes still work, and the AI
 # score is reported as unavailable. Local docker-compose uses this.
 
-FROM python:3.12-slim AS base
+FROM python:3.14-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
