@@ -3,4 +3,4 @@
 #   pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.5,<3"
 #   pip install -r requirements-ml.txt
 # (The Dockerfile does exactly this.)
-transformers==5.19.0
+transformers==5.20.0
