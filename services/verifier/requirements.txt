@@ -1,14 +1,14 @@
 # Runtime dependencies (no ML), exact pins for reproducible Docker builds.
 # Regenerate: create a fresh venv, `pip install -e .`, then copy the versions here.
-fastapi==0.143.0
-starlette==1.7.0
+fastapi==0.161.1
+starlette==1.9.0
 uvicorn[standard]==0.54.0
 python-multipart==0.0.32
-pydantic==2.14.0
-pydantic-settings==2.15.0
+pydantic==2.14.1
+pydantic-settings==2.16.1
 pillow==12.3.0
 ImageHash==4.3.2
-numpy==2.5.3
+numpy==2.5.4
 scipy==1.18.1
 PyWavelets==1.10.0
-c2pa-python==0.38.0
+c2pa-python==0.38.1
